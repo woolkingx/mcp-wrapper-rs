@@ -39,7 +39,7 @@ python3 server.py           ~50MB
 ### 從原始碼編譯
 
 ```bash
-git clone https://github.com/yourname/mcp-wrapper-rs.git
+git clone https://github.com/woolkingx/mcp-wrapper-rs.git
 cd mcp-wrapper-rs
 cargo build --release
 ```
@@ -48,7 +48,7 @@ cargo build --release
 
 ### 預編譯二進位
 
-查看 [Releases](https://github.com/yourname/mcp-wrapper-rs/releases) 獲取預編譯版本。
+查看 [Releases](https://github.com/woolkingx/mcp-wrapper-rs/releases) 獲取預編譯版本。
 
 ## 使用方法
 
