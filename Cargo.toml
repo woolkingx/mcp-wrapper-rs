@@ -1,0 +1,15 @@
+[package]
+name = "mcp-wrapper-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "z"     # 最小體積
+lto = true          # Link-time optimization
+codegen-units = 1   # 更好優化
+panic = "abort"     # 更小體積
+strip = true        # 移除 debug symbols
