@@ -119,10 +119,21 @@ Edit `~/.claude.json`:
 
 ## Debug Logging
 
-Logs are written to `/tmp/mcp-wrapper-rs.log`:
+Debug logging is **disabled by default**. Enable it with the `MCP_WRAPPER_DEBUG` environment variable:
 
 ```bash
-tail -f /tmp/mcp-wrapper-rs.log
+MCP_WRAPPER_DEBUG=1 mcp-wrapper-rs npx -y mcp-searxng
+```
+
+Each MCP server gets its own log file based on the inferred name:
+- `/tmp/mcp-wrapper-mcp-searxng.log`
+- `/tmp/mcp-wrapper-server.log` (from `server.py`)
+- `/tmp/mcp-wrapper-run_server.log` (from `run_server.sh`)
+
+You can override the name with `MCP_SERVER_NAME`:
+```bash
+MCP_SERVER_NAME=my-custom-name mcp-wrapper-rs python3 server.py
+# Logs to: /tmp/mcp-wrapper-my-custom-name.log
 ```
 
 ## Performance

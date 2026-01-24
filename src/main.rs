@@ -1,30 +1,90 @@
-//! MCP Wrapper - 通用輕量代理
+//! MCP Wrapper - Universal lightweight proxy
 //!
 //! Usage: mcp-wrapper-rs <command> [args...]
 //!
-//! 設計：
-//! - 首次啟動時呼叫 subprocess 取得 tools/list 緩存
-//! - init/tools/list 由 wrapper 瞬間回應
-//! - 只有 tools/call 才啟動 subprocess 執行
+//! Design:
+//! - On first startup, spawn subprocess to cache tools/list
+//! - init/tools/list responses are instant from cache
+//! - Only tools/call spawns subprocess for execution
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const SUBPROCESS_TIMEOUT_SECS: u64 = 60;
-const LOG_FILE: &str = "/tmp/mcp-wrapper-rs.log";
+
+static LOG_FILE: OnceLock<String> = OnceLock::new();
+static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn is_debug() -> bool {
+    *DEBUG_ENABLED.get_or_init(|| {
+        env::var("MCP_WRAPPER_DEBUG").is_ok()
+    })
+}
 
 fn log(msg: &str) {
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(LOG_FILE) {
-        let _ = writeln!(f, "{}", msg);
+    if !is_debug() {
+        return;
+    }
+    if let Some(log_file) = LOG_FILE.get() {
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_file) {
+            let _ = writeln!(f, "{}", msg);
+        }
     }
 }
 
-// === MCP 協議結構 ===
+fn infer_mcp_name(cmd: &str, args: &[String]) -> String {
+    // First try environment variable
+    if let Ok(name) = env::var("MCP_SERVER_NAME") {
+        return sanitize_name(&name);
+    }
+
+    // Infer from command line
+    if cmd == "npx" && !args.is_empty() {
+        // npx -y mcp-searxng → mcp-searxng
+        // npx @oevortex/ddg_search → ddg_search
+        for arg in args {
+            if !arg.starts_with('-') {
+                let name = arg.split('/').last().unwrap_or(arg);
+                let name = name.split('@').next().unwrap_or(name);
+                return sanitize_name(name);
+            }
+        }
+    }
+
+    // Infer from path: python3 /path/to/server.py → server
+    if (cmd == "python3" || cmd == "python") && !args.is_empty() {
+        if let Some(script) = args.first() {
+            if let Some(name) = Path::new(script).file_stem() {
+                return sanitize_name(name.to_string_lossy().as_ref());
+            }
+        }
+    }
+
+    // Shell script: /path/to/run_server.sh → run_server
+    if cmd.ends_with(".sh") {
+        if let Some(name) = Path::new(cmd).file_stem() {
+            return sanitize_name(name.to_string_lossy().as_ref());
+        }
+    }
+
+    // Fallback to command itself
+    sanitize_name(cmd)
+}
+
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+// === MCP Protocol Structures ===
 
 #[derive(Deserialize)]
 struct Request {
@@ -58,7 +118,7 @@ impl Response {
     }
 }
 
-// === 緩存的 MCP 資訊 ===
+// === Cached MCP Information ===
 
 struct McpCache {
     server_info: Value,
@@ -68,7 +128,7 @@ struct McpCache {
     resources: Value,
 }
 
-// === 呼叫 subprocess（等 N 個回應或超時） ===
+// === Run subprocess (wait for N responses or timeout) ===
 
 fn run_subprocess(cmd: &str, args: &[String], requests: &str, expected_responses: usize) -> Vec<Value> {
     log(&format!("run_subprocess: cmd={} args={:?} expected={}", cmd, args, expected_responses));
@@ -112,7 +172,7 @@ fn run_subprocess(cmd: &str, args: &[String], requests: &str, expected_responses
             if let Ok(line) = line {
                 log(&format!("got line: {}", &line[..line.len().min(100)]));
                 if let Ok(resp) = serde_json::from_str::<Value>(&line) {
-                    // 只收集有 id 的回應（跳過 notifications）
+                    // Only collect responses with id (skip notifications)
                     if resp.get("id").is_some() {
                         log(&format!("got response with id, total={}", responses.len() + 1));
                         responses.push(resp);
@@ -127,14 +187,14 @@ fn run_subprocess(cmd: &str, args: &[String], requests: &str, expected_responses
     }
 
     log(&format!("killing subprocess, got {} responses", responses.len()));
-    // 關閉 subprocess
+    // Terminate subprocess
     let _ = child.kill();
     let _ = child.wait();
 
     responses
 }
 
-// === 初始化：取得 server 資訊 ===
+// === Initialize: fetch server info ===
 
 fn init_cache(cmd: &str, args: &[String]) -> McpCache {
     let init_req = json!({
@@ -168,7 +228,7 @@ fn init_cache(cmd: &str, args: &[String]) -> McpCache {
         resources: json!([]),
     };
 
-    // 期望 4 個回應：init(0), tools(1), prompts(2), resources(3)
+    // Expect 4 responses: init(0), tools(1), prompts(2), resources(3)
     let responses = run_subprocess(cmd, args, &requests, 4);
 
     for resp in responses {
@@ -206,7 +266,7 @@ fn init_cache(cmd: &str, args: &[String]) -> McpCache {
     cache
 }
 
-// === 執行 tool ===
+// === Execute tool ===
 
 fn call_tool(cmd: &str, args: &[String], name: &str, arguments: &Value) -> Value {
     let init_req = json!({
@@ -225,10 +285,10 @@ fn call_tool(cmd: &str, args: &[String], name: &str, arguments: &Value) -> Value
 
     let requests = format!("{}\n{}\n{}\n", init_req, init_notif, tool_req);
 
-    // 期望 2 個回應：init(0), tool_call(1)
+    // Expect 2 responses: init(0), tool_call(1)
     let responses = run_subprocess(cmd, args, &requests, 2);
 
-    // 找 id=1 的回應
+    // Find response with id=1
     for resp in responses {
         if resp.get("id").and_then(|v| v.as_i64()) == Some(1) {
             if let Some(result) = resp.get("result") {
@@ -243,7 +303,7 @@ fn call_tool(cmd: &str, args: &[String], name: &str, arguments: &Value) -> Value
     json!({"content": [{"type": "text", "text": "subprocess error"}]})
 }
 
-// === 主程式 ===
+// === Main ===
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -254,16 +314,31 @@ fn main() {
         eprintln!("Example:");
         eprintln!("  {} python3 server.py", args[0]);
         eprintln!("  {} npx -y @anthropics/mcp", args[0]);
+        eprintln!();
+        eprintln!("Environment:");
+        eprintln!("  MCP_WRAPPER_DEBUG=1    Enable debug logging");
+        eprintln!("  MCP_SERVER_NAME=xxx    Override log file name");
         std::process::exit(1);
     }
 
     let cmd = &args[1];
     let cmd_args: Vec<String> = args[2..].to_vec();
 
-    // 初始化：取得 server 資訊
+    // Initialize log file name
+    let mcp_name = infer_mcp_name(cmd, &cmd_args);
+    let log_path = format!("/tmp/mcp-wrapper-{}.log", mcp_name);
+    let _ = LOG_FILE.set(log_path.clone());
+
+    if is_debug() {
+        log(&format!("=== MCP Wrapper started: {} ===", mcp_name));
+        log(&format!("cmd: {} args: {:?}", cmd, cmd_args));
+        log(&format!("log file: {}", log_path));
+    }
+
+    // Initialize: fetch server info
     let cache = init_cache(cmd, &cmd_args);
 
-    // 主循環
+    // Main loop
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -282,7 +357,7 @@ fn main() {
             Err(_) => continue,
         };
 
-        // 通知不需回應
+        // Notifications don't need response
         let id = match req.id {
             Some(id) => id,
             None => continue,
