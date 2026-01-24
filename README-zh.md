@@ -119,10 +119,21 @@ SEARXNG_URL=http://localhost:8080 mcp-wrapper-rs npx -y mcp-searxng
 
 ## 除錯日誌
 
-日誌寫入 `/tmp/mcp-wrapper-rs.log`：
+除錯日誌**預設關閉**。使用 `MCP_WRAPPER_DEBUG` 環境變數啟用：
 
 ```bash
-tail -f /tmp/mcp-wrapper-rs.log
+MCP_WRAPPER_DEBUG=1 mcp-wrapper-rs npx -y mcp-searxng
+```
+
+每個 MCP 伺服器根據推斷的名稱使用獨立的日誌檔：
+- `/tmp/mcp-wrapper-mcp-searxng.log`
+- `/tmp/mcp-wrapper-server.log` (從 `server.py` 推斷)
+- `/tmp/mcp-wrapper-run_server.log` (從 `run_server.sh` 推斷)
+
+可使用 `MCP_SERVER_NAME` 覆蓋名稱：
+```bash
+MCP_SERVER_NAME=my-custom-name mcp-wrapper-rs python3 server.py
+# 日誌寫入: /tmp/mcp-wrapper-my-custom-name.log
 ```
 
 ## 效能對比
@@ -133,6 +144,24 @@ tail -f /tmp/mcp-wrapper-rs.log
 | 二進位大小 | N/A | 432KB |
 | `tools/list` 延遲 | ~2s | <1ms |
 | `tools/call` 延遲 | 相同 | 相同 |
+
+### 實際使用效果
+
+在生產環境部署 8 個 MCP 伺服器後的實測數據：
+
+**啟動性能**
+- Claude Code 啟動時間：**快約 40%**
+- MCP 初始化：從 ~10 秒降至 <1 秒（快取即時回應）
+
+**運行性能**
+- CPU 負載：**降低約 40%**（無閒置 MCP 進程）
+- 回應延遲：協議查詢從快取即時返回
+- 僅在工具執行時活動（按需啟動子進程）
+
+**為何更快**
+- **按需啟動子進程**：進程僅在需要時運行，消除閒置開銷
+- **快取優先設計**：`initialize`、`tools/list`、`prompts/list`、`resources/list` 從記憶體提供
+- **乾淨的資源生命週期**：工具執行完成後立即終止子進程
 
 ## 相容性
 
