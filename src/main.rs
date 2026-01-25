@@ -17,6 +17,9 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 const SUBPROCESS_TIMEOUT_SECS: u64 = 60;
 
 static LOG_FILE: OnceLock<String> = OnceLock::new();
@@ -133,13 +136,28 @@ struct McpCache {
 fn run_subprocess(cmd: &str, args: &[String], requests: &str, expected_responses: usize) -> Vec<Value> {
     log(&format!("run_subprocess: cmd={} args={:?} expected={}", cmd, args, expected_responses));
 
-    let mut child = match Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+    #[cfg(unix)]
+    let mut command = {
+        let mut cmd = Command::new(cmd);
+        cmd.args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0); // Create new process group
+        cmd
+    };
+
+    #[cfg(not(unix))]
+    let mut command = {
+        let mut cmd = Command::new(cmd);
+        cmd.args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        cmd
+    };
+
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
             log(&format!("spawn error: {}", e));
@@ -188,8 +206,23 @@ fn run_subprocess(cmd: &str, args: &[String], requests: &str, expected_responses
     }
 
     log(&format!("killing subprocess, got {} responses", responses.len()));
-    // Terminate subprocess
-    let _ = child.kill();
+
+    // Terminate subprocess and its entire process group
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        // Kill the entire process group (negative PID kills process group)
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+        log("sent SIGTERM to process group");
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+
     let _ = child.wait();
 
     responses

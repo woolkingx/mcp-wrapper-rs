@@ -41,10 +41,12 @@ Result: **4 MCP servers using only ~8MB total** (vs ~370MB before)
 ```bash
 git clone https://github.com/woolkingx/mcp-wrapper-rs.git
 cd mcp-wrapper-rs
-cargo build --release
+cargo install --path .
 ```
 
-Binary will be at `target/release/mcp-wrapper-rs` (~432KB)
+This will compile in release mode and install the binary to `~/.cargo/bin/mcp-wrapper-rs` (~440KB).
+
+**For development**: Use `cargo build --release` to build without installing. Binary will be at `target/release/mcp-wrapper-rs`.
 
 ### Pre-built Binaries
 

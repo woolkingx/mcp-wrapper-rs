@@ -41,10 +41,12 @@ python3 server.py           ~50MB
 ```bash
 git clone https://github.com/woolkingx/mcp-wrapper-rs.git
 cd mcp-wrapper-rs
-cargo build --release
+cargo install --path .
 ```
 
-二進位檔案位於 `target/release/mcp-wrapper-rs`（約 432KB）
+這將以 release 模式編譯並安裝二進位檔案到 `~/.cargo/bin/mcp-wrapper-rs`（約 440KB）。
+
+**開發時**: 使用 `cargo build --release` 編譯但不安裝。二進位檔案位於 `target/release/mcp-wrapper-rs`。
 
 ### 預編譯二進位
 
