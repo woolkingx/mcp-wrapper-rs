@@ -149,14 +149,15 @@ fn run_subprocess(cmd: &str, args: &[String], requests: &str, expected_responses
 
     log("subprocess spawned");
 
-    // 寫入請求（不關閉 stdin）
-    if let Some(ref mut stdin) = child.stdin {
+    // Write requests and close stdin (MCP server needs EOF to process)
+    if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(requests.as_bytes());
         let _ = stdin.flush();
-        log("requests written");
+        drop(stdin); // Close stdin, trigger EOF
+        log("requests written and stdin closed");
     }
 
-    // 讀取回應（等 N 個有 id 的回應，或超時）
+    // Read responses (wait for N responses with id, or timeout)
     let mut responses = Vec::new();
     let start = Instant::now();
     let timeout = Duration::from_secs(SUBPROCESS_TIMEOUT_SECS);
