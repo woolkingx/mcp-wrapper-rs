@@ -339,19 +339,53 @@ fn call_tool(cmd: &str, args: &[String], name: &str, arguments: &Value) -> Value
 
 // === Main ===
 
+fn print_usage(program: &str) {
+    eprintln!("mcp-wrapper-rs - Universal lightweight MCP proxy");
+    eprintln!();
+    eprintln!("Usage: {} <command> [args...]", program);
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --version, -V    Show version and exit");
+    eprintln!("  --help, -h       Show this help and exit");
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  {} python3 server.py", program);
+    eprintln!("  {} npx -y @anthropics/mcp-searxng", program);
+    eprintln!("  {} /path/to/run_server.sh", program);
+    eprintln!();
+    eprintln!("Environment Variables:");
+    eprintln!("  MCP_WRAPPER_DEBUG=1    Enable debug logging to /tmp/mcp-wrapper-*.log");
+    eprintln!("  MCP_SERVER_NAME=xxx    Override inferred server name for logs");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
+    // Handle flags (--version, --help, or unknown flags)
+    if args.len() >= 2 && args[1].starts_with("-") {
+        match args[1].as_str() {
+            "--version" | "-V" => {
+                println!("mcp-wrapper-rs 0.1.1");
+                return;
+            }
+            "--help" | "-h" => {
+                print_usage(&args[0]);
+                return;
+            }
+            unknown_flag => {
+                eprintln!("Error: Unknown option: {}", unknown_flag);
+                eprintln!();
+                print_usage(&args[0]);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // No arguments provided - show help
     if args.len() < 2 {
-        eprintln!("Usage: {} <command> [args...]", args[0]);
+        eprintln!("Error: Missing <command> argument");
         eprintln!();
-        eprintln!("Example:");
-        eprintln!("  {} python3 server.py", args[0]);
-        eprintln!("  {} npx -y @anthropics/mcp", args[0]);
-        eprintln!();
-        eprintln!("Environment:");
-        eprintln!("  MCP_WRAPPER_DEBUG=1    Enable debug logging");
-        eprintln!("  MCP_SERVER_NAME=xxx    Override log file name");
+        print_usage(&args[0]);
         std::process::exit(1);
     }
 
@@ -412,6 +446,8 @@ fn main() {
             "tools/list" => Response::success(id, json!({"tools": cache.tools})),
             "prompts/list" => Response::success(id, json!({"prompts": cache.prompts})),
             "resources/list" => Response::success(id, json!({"resources": cache.resources})),
+
+            "ping" => Response::success(id, json!({})),
 
             "tools/call" => {
                 let params = req.params.unwrap_or(json!({}));
