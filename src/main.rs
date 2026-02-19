@@ -6,19 +6,22 @@
 //! - On first startup, spawn subprocess to cache tools/list
 //! - init/tools/list responses are instant from cache
 //! - Only tools/call spawns subprocess for execution
+//! - Async event loop keeps process alive (like Node/Python MCP servers)
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::Write as IoWrite;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::process::Command;
+use tokio::time::timeout;
+use std::process::Stdio;
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+
 
 const SUBPROCESS_TIMEOUT_SECS: u64 = 60;
 
@@ -26,9 +29,7 @@ static LOG_FILE: OnceLock<String> = OnceLock::new();
 static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn is_debug() -> bool {
-    *DEBUG_ENABLED.get_or_init(|| {
-        env::var("MCP_WRAPPER_DEBUG").is_ok()
-    })
+    *DEBUG_ENABLED.get_or_init(|| env::var("MCP_WRAPPER_DEBUG").is_ok())
 }
 
 fn log(msg: &str) {
@@ -43,15 +44,11 @@ fn log(msg: &str) {
 }
 
 fn infer_mcp_name(cmd: &str, args: &[String]) -> String {
-    // First try environment variable
     if let Ok(name) = env::var("MCP_SERVER_NAME") {
         return sanitize_name(&name);
     }
 
-    // Infer from command line
     if cmd == "npx" && !args.is_empty() {
-        // npx -y mcp-searxng → mcp-searxng
-        // npx @oevortex/ddg_search → ddg_search
         for arg in args {
             if !arg.starts_with('-') {
                 let name = arg.split('/').last().unwrap_or(arg);
@@ -61,7 +58,6 @@ fn infer_mcp_name(cmd: &str, args: &[String]) -> String {
         }
     }
 
-    // Infer from path: python3 /path/to/server.py → server
     if (cmd == "python3" || cmd == "python") && !args.is_empty() {
         if let Some(script) = args.first() {
             if let Some(name) = Path::new(script).file_stem() {
@@ -70,14 +66,12 @@ fn infer_mcp_name(cmd: &str, args: &[String]) -> String {
         }
     }
 
-    // Shell script: /path/to/run_server.sh → run_server
     if cmd.ends_with(".sh") {
         if let Some(name) = Path::new(cmd).file_stem() {
             return sanitize_name(name.to_string_lossy().as_ref());
         }
     }
 
-    // Fallback to command itself
     sanitize_name(cmd)
 }
 
@@ -133,7 +127,12 @@ struct McpCache {
 
 // === Run subprocess (wait for N responses or timeout) ===
 
-fn run_subprocess(cmd: &str, args: &[String], requests: &str, expected_responses: usize) -> Vec<Value> {
+async fn run_subprocess(
+    cmd: &str,
+    args: &[String],
+    requests: &str,
+    expected_responses: usize,
+) -> Vec<Value> {
     log(&format!("run_subprocess: cmd={} args={:?} expected={}", cmd, args, expected_responses));
 
     #[cfg(unix)]
@@ -142,8 +141,16 @@ fn run_subprocess(cmd: &str, args: &[String], requests: &str, expected_responses
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0); // Create new process group
+            .stderr(Stdio::null());
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
         cmd
     };
 
@@ -167,31 +174,23 @@ fn run_subprocess(cmd: &str, args: &[String], requests: &str, expected_responses
 
     log("subprocess spawned");
 
-    // Write requests and close stdin (MCP server needs EOF to process)
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(requests.as_bytes());
-        let _ = stdin.flush();
-        drop(stdin); // Close stdin, trigger EOF
+        let _ = stdin.write_all(requests.as_bytes()).await;
+        let _ = stdin.flush().await;
+        drop(stdin);
         log("requests written and stdin closed");
     }
 
-    // Read responses (wait for N responses with id, or timeout)
     let mut responses = Vec::new();
-    let start = Instant::now();
-    let timeout = Duration::from_secs(SUBPROCESS_TIMEOUT_SECS);
+    let timeout_duration = Duration::from_secs(SUBPROCESS_TIMEOUT_SECS);
 
     if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
         log("reading stdout...");
-        for line in reader.lines() {
-            if start.elapsed() > timeout {
-                log("timeout!");
-                break;
-            }
-            if let Ok(line) = line {
+        let mut reader = tokio::io::BufReader::new(stdout).lines();
+        let read_result = timeout(timeout_duration, async {
+            while let Ok(Some(line)) = reader.next_line().await {
                 log(&format!("got line: {}", &line[..line.len().min(100)]));
                 if let Ok(resp) = serde_json::from_str::<Value>(&line) {
-                    // Only collect responses with id (skip notifications)
                     if resp.get("id").is_some() {
                         log(&format!("got response with id, total={}", responses.len() + 1));
                         responses.push(resp);
@@ -202,39 +201,43 @@ fn run_subprocess(cmd: &str, args: &[String], requests: &str, expected_responses
                     }
                 }
             }
+        })
+        .await;
+
+        if read_result.is_err() {
+            log("timeout!");
         }
     }
 
     log(&format!("killing subprocess, got {} responses", responses.len()));
 
-    // Terminate subprocess and its entire process group
     #[cfg(unix)]
     {
-        let pid = child.id();
-        // Kill the entire process group (negative PID kills process group)
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
+        if let Some(pid) = child.id() {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGTERM);
+            }
+            log("sent SIGTERM to process group");
         }
-        log("sent SIGTERM to process group");
     }
 
     #[cfg(not(unix))]
     {
-        let _ = child.kill();
+        let _ = child.kill().await;
     }
 
-    let _ = child.wait();
+    let _ = child.wait().await;
 
     responses
 }
 
 // === Initialize: fetch server info ===
 
-fn init_cache(cmd: &str, args: &[String]) -> McpCache {
+async fn init_cache(cmd: &str, args: &[String]) -> McpCache {
     let init_req = json!({
         "jsonrpc": "2.0", "id": 0, "method": "initialize",
         "params": {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-11-25",
             "capabilities": {},
             "clientInfo": {"name": "mcp-wrapper-rs", "version": "1.0"}
         }
@@ -262,8 +265,7 @@ fn init_cache(cmd: &str, args: &[String]) -> McpCache {
         resources: json!([]),
     };
 
-    // Expect 4 responses: init(0), tools(1), prompts(2), resources(3)
-    let responses = run_subprocess(cmd, args, &requests, 4);
+    let responses = run_subprocess(cmd, args, &requests, 4).await;
 
     for resp in responses {
         let id = resp.get("id").and_then(|v| v.as_i64());
@@ -302,11 +304,11 @@ fn init_cache(cmd: &str, args: &[String]) -> McpCache {
 
 // === Execute tool ===
 
-fn call_tool(cmd: &str, args: &[String], name: &str, arguments: &Value) -> Value {
+async fn call_tool(cmd: &str, args: &[String], name: &str, arguments: &Value) -> Value {
     let init_req = json!({
         "jsonrpc": "2.0", "id": 0, "method": "initialize",
         "params": {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-11-25",
             "capabilities": {},
             "clientInfo": {"name": "mcp-wrapper-rs", "version": "1.0"}
         }
@@ -318,11 +320,8 @@ fn call_tool(cmd: &str, args: &[String], name: &str, arguments: &Value) -> Value
     });
 
     let requests = format!("{}\n{}\n{}\n", init_req, init_notif, tool_req);
+    let responses = run_subprocess(cmd, args, &requests, 2).await;
 
-    // Expect 2 responses: init(0), tool_call(1)
-    let responses = run_subprocess(cmd, args, &requests, 2);
-
-    // Find response with id=1
     for resp in responses {
         if resp.get("id").and_then(|v| v.as_i64()) == Some(1) {
             if let Some(result) = resp.get("result") {
@@ -361,11 +360,11 @@ fn print_usage(program: &str) {
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Handle flags (--version, --help, or unknown flags)
+    // Handle flags before starting runtime
     if args.len() >= 2 && args[1].starts_with("-") {
         match args[1].as_str() {
             "--version" | "-V" => {
-                println!("mcp-wrapper-rs 0.1.1");
+                println!("mcp-wrapper-rs 0.1.2");
                 return;
             }
             "--help" | "-h" => {
@@ -381,7 +380,6 @@ fn main() {
         }
     }
 
-    // No arguments provided - show help
     if args.len() < 2 {
         eprintln!("Error: Missing <command> argument");
         eprintln!();
@@ -389,82 +387,158 @@ fn main() {
         std::process::exit(1);
     }
 
-    let cmd = &args[1];
+    // Single-thread runtime: ~1-2MB RSS, no thread pool overhead
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("failed to create tokio runtime");
+
+    rt.block_on(async_main(args));
+}
+
+async fn async_main(args: Vec<String>) {
+    let cmd = args[1].clone();
     let cmd_args: Vec<String> = args[2..].to_vec();
 
-    // Initialize log file name
-    let mcp_name = infer_mcp_name(cmd, &cmd_args);
+    // Initialize log file
+    let mcp_name = infer_mcp_name(&cmd, &cmd_args);
     let log_path = format!("/tmp/mcp-wrapper-{}.log", mcp_name);
     let _ = LOG_FILE.set(log_path.clone());
 
+    // Register signal handlers FIRST — before any blocking work.
+    // ctrl_c() is cross-platform (SIGINT on Unix, Ctrl+C on Windows).
+    // SIGTERM/SIGHUP are Unix-only; on other platforms, recv_sigterm/recv_sighup
+    // resolve to pending() (never fires).
+    #[cfg(unix)]
+    let (mut sigterm, mut sighup) = {
+        use tokio::signal::unix::SignalKind;
+        (
+            tokio::signal::unix::signal(SignalKind::terminate())
+                .expect("failed to register SIGTERM handler"),
+            tokio::signal::unix::signal(SignalKind::hangup())
+                .expect("failed to register SIGHUP handler"),
+        )
+    };
+
     if is_debug() {
-        log(&format!("=== MCP Wrapper started: {} ===", mcp_name));
+        log(&format!("=== MCP Wrapper started (async): {} ===", mcp_name));
         log(&format!("cmd: {} args: {:?}", cmd, cmd_args));
-        log(&format!("log file: {}", log_path));
     }
 
-    // Initialize: fetch server info
-    let cache = init_cache(cmd, &cmd_args);
+    // Helper closures for cross-platform signal handling.
+    // On Unix: wait for real SIGTERM/SIGHUP. On Windows: pending (never fires).
+    #[cfg(unix)]
+    macro_rules! recv_sigterm { () => { sigterm.recv() } }
+    #[cfg(not(unix))]
+    macro_rules! recv_sigterm { () => { std::future::pending::<Option<()>>() } }
+    #[cfg(unix)]
+    macro_rules! recv_sighup { () => { sighup.recv() } }
+    #[cfg(not(unix))]
+    macro_rules! recv_sighup { () => { std::future::pending::<Option<()>>() } }
 
-    // Main loop
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-
-        if line.is_empty() {
-            continue;
+    let cache = tokio::select! {
+        c = init_cache(&cmd, &cmd_args) => c,
+        _ = tokio::signal::ctrl_c() => {
+            log("[EVENT] SIGINT during init");
+            return;
         }
+        _ = recv_sigterm!() => {
+            log("[EVENT] SIGTERM during init");
+            return;
+        }
+        _ = recv_sighup!() => {
+            log("[EVENT] SIGHUP during init");
+            return;
+        }
+    };
 
-        let req: Request = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+    let stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut reader = tokio::io::BufReader::new(stdin).lines();
 
-        // Notifications don't need response
-        let id = match req.id {
-            Some(id) => id,
-            None => continue,
-        };
-
-        let method = req.method.unwrap_or_default();
-
-        let response = match method.as_str() {
-            "initialize" => Response::success(
-                id,
-                json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": cache.capabilities,
-                    "serverInfo": cache.server_info
-                }),
-            ),
-
-            "tools/list" => Response::success(id, json!({"tools": cache.tools})),
-            "prompts/list" => Response::success(id, json!({"prompts": cache.prompts})),
-            "resources/list" => Response::success(id, json!({"resources": cache.resources})),
-
-            "ping" => Response::success(id, json!({})),
-
-            "tools/call" => {
-                let params = req.params.unwrap_or(json!({}));
-                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let empty = json!({});
-                let arguments = params.get("arguments").unwrap_or(&empty);
-
-                let result = call_tool(cmd, &cmd_args, name, arguments);
-                Response::success(id, result)
+    // Unified event loop: every IO event is logged
+    loop {
+        tokio::select! {
+            line = reader.next_line() => {
+                match line {
+                    Ok(Some(ref line)) if line.is_empty() => continue,
+                    Ok(Some(line)) => {
+                        log(&format!("[IN] {}", &line[..line.len().min(300)]));
+                        if let Some(out) = handle_request(&line, &cache, &cmd, &cmd_args).await {
+                            log(&format!("[OUT] {}", &out[..out.len().min(300)]));
+                            let _ = stdout.write_all(out.as_bytes()).await;
+                            let _ = stdout.write_all(b"\n").await;
+                            let _ = stdout.flush().await;
+                        }
+                    }
+                    Ok(None) => {
+                        log("[EVENT] stdin EOF");
+                        return;
+                    }
+                    Err(e) => {
+                        log(&format!("[EVENT] stdin error: {}", e));
+                        return;
+                    }
+                }
             }
-
-            _ => Response::error(id, -32601, &format!("Method not found: {}", method)),
-        };
-
-        if let Ok(json) = serde_json::to_string(&response) {
-            let _ = writeln!(stdout, "{}", json);
-            let _ = stdout.flush();
+            _ = tokio::signal::ctrl_c() => {
+                log("[EVENT] SIGINT");
+                return;
+            }
+            _ = recv_sigterm!() => {
+                log("[EVENT] SIGTERM");
+                return;
+            }
+            _ = recv_sighup!() => {
+                log("[EVENT] SIGHUP");
+                return;
+            }
         }
     }
+}
+
+/// Handle a single JSON-RPC request. Returns serialized response or None (for notifications).
+async fn handle_request(
+    line: &str,
+    cache: &McpCache,
+    cmd: &str,
+    cmd_args: &[String],
+) -> Option<String> {
+    let req: Request = serde_json::from_str(line).ok()?;
+    let id = req.id?; // notifications have no id → return None
+    let method = req.method.unwrap_or_default();
+
+    let protocol_version = req.params.as_ref()
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("2025-11-25")
+        .to_string();
+
+    let response = match method.as_str() {
+        "initialize" => Response::success(
+            id,
+            json!({
+                "protocolVersion": protocol_version,
+                "capabilities": cache.capabilities,
+                "serverInfo": cache.server_info
+            }),
+        ),
+        "tools/list" => Response::success(id, json!({"tools": cache.tools})),
+        "prompts/list" => Response::success(id, json!({"prompts": cache.prompts})),
+        "resources/list" => Response::success(id, json!({"resources": cache.resources})),
+        "ping" => Response::success(id, json!({})),
+        "shutdown" => Response::success(id, json!({})),
+        "tools/call" => {
+            let params = req.params.unwrap_or(json!({}));
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let empty = json!({});
+            let arguments = params.get("arguments").unwrap_or(&empty);
+            let result = call_tool(cmd, cmd_args, name, arguments).await;
+            Response::success(id, result)
+        }
+        _ => Response::error(id, -32601, &format!("Method not found: {}", method)),
+    };
+
+    serde_json::to_string(&response).ok()
 }
