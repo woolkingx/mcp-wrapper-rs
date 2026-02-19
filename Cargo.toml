@@ -7,7 +7,7 @@ edition = "2021"
 libc = "0.2.180"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["rt", "io-util", "io-std", "signal", "macros", "process", "time"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "io-std", "signal", "macros", "process", "time"] }
 
 [profile.release]
 opt-level = "z"     # 最小體積
