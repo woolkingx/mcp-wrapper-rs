@@ -116,13 +116,13 @@ impl Response {
 }
 
 // === Cached MCP Information ===
+// Stores raw server responses keyed by method. On replay, only the "id" is replaced.
 
 struct McpCache {
-    server_info: Value,
-    capabilities: Value,
-    tools: Value,
-    prompts: Value,
-    resources: Value,
+    initialize: Value,
+    tools_list: Value,
+    prompts_list: Value,
+    resources_list: Value,
 }
 
 // === Run subprocess (wait for N responses or timeout) ===
@@ -252,50 +252,24 @@ async fn init_cache(cmd: &str, args: &[String]) -> McpCache {
         init_req, init_notif, tools_req, prompts_req, resources_req
     );
 
+    // Defaults: used only when server returns no response at all
     let mut cache = McpCache {
-        server_info: json!({"name": "mcp-wrapper", "version": "1.0.0"}),
-        capabilities: json!({
-            "experimental": {},
-            "prompts": {"listChanged": false},
-            "resources": {"subscribe": false, "listChanged": false},
-            "tools": {"listChanged": false}
-        }),
-        tools: json!([]),
-        prompts: json!([]),
-        resources: json!([]),
+        initialize: json!({"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"unknown","version":"0.0.0"}}}),
+        tools_list: json!({"jsonrpc":"2.0","id":1,"result":{"tools":[]}}),
+        prompts_list: json!({"jsonrpc":"2.0","id":2,"result":{"prompts":[]}}),
+        resources_list: json!({"jsonrpc":"2.0","id":3,"result":{"resources":[]}}),
     };
 
     let responses = run_subprocess(cmd, args, &requests, 4).await;
 
+    // Store raw responses (success or error) keyed by the id we sent
     for resp in responses {
-        let id = resp.get("id").and_then(|v| v.as_i64());
-        if let Some(result) = resp.get("result") {
-            match id {
-                Some(0) => {
-                    if let Some(info) = result.get("serverInfo") {
-                        cache.server_info = info.clone();
-                    }
-                    if let Some(caps) = result.get("capabilities") {
-                        cache.capabilities = caps.clone();
-                    }
-                }
-                Some(1) => {
-                    if let Some(tools) = result.get("tools") {
-                        cache.tools = tools.clone();
-                    }
-                }
-                Some(2) => {
-                    if let Some(prompts) = result.get("prompts") {
-                        cache.prompts = prompts.clone();
-                    }
-                }
-                Some(3) => {
-                    if let Some(resources) = result.get("resources") {
-                        cache.resources = resources.clone();
-                    }
-                }
-                _ => {}
-            }
+        match resp.get("id").and_then(|v| v.as_i64()) {
+            Some(0) => cache.initialize = resp,
+            Some(1) => cache.tools_list = resp,
+            Some(2) => cache.prompts_list = resp,
+            Some(3) => cache.resources_list = resp,
+            _ => {}
         }
     }
 
@@ -403,7 +377,7 @@ async fn async_main(args: Vec<String>) {
 
     // Initialize log file
     let mcp_name = infer_mcp_name(&cmd, &cmd_args);
-    let log_path = format!("/tmp/mcp-wrapper-{}.log", mcp_name);
+    let log_path = format!("/tmp/mcp-wrapper-{}-{}.log", mcp_name, std::process::id());
     let _ = LOG_FILE.set(log_path.clone());
 
     // Register signal handlers FIRST — before any blocking work.
@@ -499,6 +473,19 @@ async fn async_main(args: Vec<String>) {
 }
 
 /// Handle a single JSON-RPC request. Returns serialized response or None (for notifications).
+/// Replay a cached raw response, replacing its "id" with the client's request id.
+/// For "initialize", also patch protocolVersion to match the client's requested version.
+fn replay_cached(cached: &Value, client_id: &Value, protocol_version: Option<&str>) -> Option<String> {
+    let mut resp = cached.clone();
+    resp["id"] = client_id.clone();
+    if let Some(pv) = protocol_version {
+        if let Some(result) = resp.get_mut("result") {
+            result["protocolVersion"] = json!(pv);
+        }
+    }
+    serde_json::to_string(&resp).ok()
+}
+
 async fn handle_request(
     line: &str,
     cache: &McpCache,
@@ -509,36 +496,27 @@ async fn handle_request(
     let id = req.id?; // notifications have no id → return None
     let method = req.method.unwrap_or_default();
 
-    let protocol_version = req.params.as_ref()
-        .and_then(|p| p.get("protocolVersion"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("2025-11-25")
-        .to_string();
-
-    let response = match method.as_str() {
-        "initialize" => Response::success(
-            id,
-            json!({
-                "protocolVersion": protocol_version,
-                "capabilities": cache.capabilities,
-                "serverInfo": cache.server_info
-            }),
-        ),
-        "tools/list" => Response::success(id, json!({"tools": cache.tools})),
-        "prompts/list" => Response::success(id, json!({"prompts": cache.prompts})),
-        "resources/list" => Response::success(id, json!({"resources": cache.resources})),
-        "ping" => Response::success(id, json!({})),
-        "shutdown" => Response::success(id, json!({})),
+    match method.as_str() {
+        "initialize" => {
+            let pv = req.params.as_ref()
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("2025-11-25");
+            replay_cached(&cache.initialize, &id, Some(pv))
+        }
+        "tools/list" => replay_cached(&cache.tools_list, &id, None),
+        "prompts/list" => replay_cached(&cache.prompts_list, &id, None),
+        "resources/list" => replay_cached(&cache.resources_list, &id, None),
+        "ping" => serde_json::to_string(&Response::success(id, json!({}))).ok(),
+        "shutdown" => serde_json::to_string(&Response::success(id, json!({}))).ok(),
         "tools/call" => {
             let params = req.params.unwrap_or(json!({}));
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let empty = json!({});
             let arguments = params.get("arguments").unwrap_or(&empty);
             let result = call_tool(cmd, cmd_args, name, arguments).await;
-            Response::success(id, result)
+            serde_json::to_string(&Response::success(id, result)).ok()
         }
-        _ => Response::error(id, -32601, &format!("Method not found: {}", method)),
-    };
-
-    serde_json::to_string(&response).ok()
+        _ => serde_json::to_string(&Response::error(id, -32601, &format!("Method not found: {}", method))).ok(),
+    }
 }
