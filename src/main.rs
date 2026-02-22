@@ -342,7 +342,7 @@ fn main() {
     if args.len() >= 2 && args[1].starts_with("-") {
         match args[1].as_str() {
             "--version" | "-V" => {
-                println!("mcp-wrapper-rs 0.1.2");
+                println!("mcp-wrapper-rs 0.1.3");
                 return;
             }
             "--help" | "-h" => {
