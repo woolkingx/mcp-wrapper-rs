@@ -260,7 +260,9 @@ async fn init_cache(cmd: &str, args: &[String]) -> McpCache {
         resources_list: json!({"jsonrpc":"2.0","id":3,"result":{"resources":[]}}),
     };
 
-    let responses = run_subprocess(cmd, args, &requests, 4).await;
+    // Only expect responses for methods that are actually queried
+    // Always: initialize (id=0) + tools/list (id=1)
+    let responses = run_subprocess(cmd, args, &requests, 2).await;
 
     // Store raw responses (success or error) keyed by the id we sent
     for resp in responses {
