@@ -194,6 +194,8 @@ async fn run_subprocess(
                     if resp.get("id").is_some() {
                         log(&format!("got response with id, total={}", responses.len() + 1));
                         responses.push(resp);
+                        // Return early after receiving expected number of responses
+                        // Additional prompts/resources queries may return errors, skip them
                         if responses.len() >= expected_responses {
                             log("got all expected responses");
                             break;
