@@ -30,7 +30,7 @@ Total                       ~370MB (idle!)
 
 - **Startup**: Spawns subprocess once to cache `tools/list`, `prompts/list`, `resources/list`
 - **Runtime**: Responds instantly from cache for protocol queries
-- **Tool calls**: Spawns subprocess, executes, returns result, kills subprocess
+- **Tool calls**: Maintains a persistent subprocess connection; reuses it across calls (auto-respawns on failure)
 
 Result: **4 MCP servers using only ~8MB total** (vs ~370MB before)
 
@@ -55,7 +55,7 @@ Check [Releases](https://github.com/woolkingx/mcp-wrapper-rs/releases) for pre-b
 ## Usage
 
 ```bash
-mcp-wrapper-rs <command> [args...]
+mcp-wrapper-rs [--init-timeout <secs>] <command> [args...]
 ```
 
 ### Examples
@@ -69,6 +69,9 @@ mcp-wrapper-rs python3 /path/to/server.py
 
 # Wrap with environment variables (inherited from parent)
 SEARXNG_URL=http://localhost:8080 mcp-wrapper-rs npx -y mcp-searxng
+
+# Use custom init timeout (default: 5s; increase for slow-starting servers)
+mcp-wrapper-rs --init-timeout 15 npx -y mcp-searxng
 ```
 
 ### Claude Code Configuration
@@ -103,21 +106,22 @@ Edit `~/.claude.json`:
 ## How It Works
 
 1. **Initialization Phase**
-   - Spawns subprocess with MCP `initialize` + `tools/list` + `prompts/list` + `resources/list`
-   - Waits for 4 responses (with 60s timeout)
-   - Caches all responses, kills subprocess
+   - Spawns subprocess, performs MCP handshake via rmcp SDK
+   - Queries `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list` (with pagination)
+   - Each query has a configurable timeout (`--init-timeout`, default 5s); unresponsive servers are skipped
+   - Caches all results, kills init subprocess
 
 2. **Runtime Phase**
    - `initialize` → Instant response from cache
    - `tools/list` → Instant response from cache
    - `prompts/list` → Instant response from cache
    - `resources/list` → Instant response from cache
-   - `tools/call` → Spawns subprocess, executes, returns, kills
+   - `tools/call` → Forwarded to persistent backend subprocess
 
 3. **Resource Management**
-   - Subprocess only lives during `tools/call` execution
-   - 60-second timeout prevents hanging
-   - Clean process termination with kill + wait
+   - Persistent backend subprocess reused across tool calls
+   - Dead backend auto-respawns on next call
+   - rmcp SDK handles process lifecycle and protocol details
 
 ## Debug Logging
 
@@ -127,15 +131,15 @@ Debug logging is **disabled by default**. Enable it with the `MCP_WRAPPER_DEBUG`
 MCP_WRAPPER_DEBUG=1 mcp-wrapper-rs npx -y mcp-searxng
 ```
 
-Each MCP server gets its own log file based on the inferred name:
-- `/tmp/mcp-wrapper-mcp-searxng.log`
-- `/tmp/mcp-wrapper-server.log` (from `server.py`)
-- `/tmp/mcp-wrapper-run_server.log` (from `run_server.sh`)
+Each MCP server gets its own log file based on the inferred name. Log location follows XDG Base Directory spec:
+- `$XDG_RUNTIME_DIR/mcp-wrapper/mcp-searxng.log` (Linux with XDG runtime dir)
+- `$TMPDIR/mcp-wrapper/mcp-searxng.log` (macOS or custom TMPDIR)
+- `/tmp/mcp-wrapper/mcp-searxng.log` (fallback)
 
 You can override the name with `MCP_SERVER_NAME`:
 ```bash
 MCP_SERVER_NAME=my-custom-name mcp-wrapper-rs python3 server.py
-# Logs to: /tmp/mcp-wrapper-my-custom-name.log
+# Logs to: $XDG_RUNTIME_DIR/mcp-wrapper/my-custom-name.log
 ```
 
 ## Performance
@@ -143,7 +147,7 @@ MCP_SERVER_NAME=my-custom-name mcp-wrapper-rs python3 server.py
 | Metric | Before | After |
 |--------|--------|-------|
 | Memory (4 servers) | ~370MB | ~8MB |
-| Binary size | N/A | 432KB |
+| Binary size | N/A | ~1.6MB |
 | `tools/list` latency | ~2s | <1ms |
 | `tools/call` latency | Same | Same |
 
