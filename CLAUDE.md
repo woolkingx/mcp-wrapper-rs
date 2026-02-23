@@ -7,8 +7,8 @@
    - Pattern: Check for `-` prefix → match known flags → error on unknown → fallback to command mode
 
 2. **ALWAYS use `cargo build --release` for production binaries**
-   - *WHY: Debug builds are 10x larger and 50x slower*
-   - Size: Release ~440KB, Debug ~4MB
+   - *WHY: Debug builds are 10x larger and much slower*
+   - Size: Release ~1.6MB (rmcp SDK + dependencies), Debug ~10MB+
 
 3. **REQUIRED: Test with real MCP servers before releasing**
    - *WHY: Subprocess timing is environment-specific*
@@ -21,29 +21,34 @@
 ## Architecture Overview
 
 ```
-┌────────────┐  stdin   ┌──────────────────┐  subprocess  ┌─────────────┐
-│ Claude     │ ◄──────► │ mcp-wrapper-rs   │ ────────────► │ MCP Server  │
-│ Code       │  stdout  │ (Rust proxy)     │  on-demand   │ (Node/Py)   │
-└────────────┘          └──────────────────┘              └─────────────┘
-                              ~2MB                          spawned only
-                                                           during tool call
+Client → [stdin/stdout] → rmcp serve_server(McpProxy) → ServerHandler trait
+                                   ↓ (on tools/call)
+                          McpProxy.ensure_backend()
+                                   ↓
+                          rmcp serve_client(TokioChildProcess) → real MCP server
 ```
+
+### Key Design: McpProxy (ServerHandler)
+
+- **McpProxy** struct implements `rmcp::ServerHandler` trait
+- On startup: spawns subprocess via rmcp client, caches tools/prompts/resources/resource_templates, kills init subprocess
+- On serve: rmcp handles full JSON-RPC protocol on stdin/stdout
+- On tool call: lazy-spawns persistent backend subprocess, reuses for subsequent calls
+- Backend auto-recovers if subprocess dies (`is_closed()` check → re-spawn)
 
 ### Key Files
 ```
 src/
-├── main.rs              # Entry point, CLI arg parsing, main event loop (435 lines)
-├── subprocess.rs        # Process spawning, timeout handling (implicit in main.rs)
-└── cache.rs            # Protocol response cache (implicit in main.rs)
+└── main.rs              # Everything: CLI, McpProxy, ServerHandler impl (~327 lines)
 
-Cargo.toml              # Dependencies: serde_json, libc
-target/release/         # Compiled binary (~440KB with strip=true)
+Cargo.toml              # Dependencies: rmcp (client+server+transport), tokio
+target/release/         # Compiled binary (~1.6MB with strip=true)
 ```
 
 ### Memory Model
-- **Startup**: Spawn once → cache 4 responses → kill subprocess
-- **Runtime**: Serve `initialize`/`tools/list`/`prompts/list`/`resources/list` from cache (instant)
-- **Tool execution**: Spawn → execute → kill (clean lifecycle)
+- **Startup**: Spawn once → rmcp client handshake → `list_all_tools/prompts/resources` (with pagination) → cache → kill subprocess
+- **Runtime**: Serve `initialize`/`tools/list`/`prompts/list`/`resources/list` from cache (instant, rmcp handles id/protocol)
+- **Tool execution**: Lazy spawn persistent backend → forward via `peer.call_tool()` → reuse connection for subsequent calls
 
 ## Key Commands
 
@@ -52,7 +57,7 @@ target/release/         # Compiled binary (~440KB with strip=true)
 # Build for development (unoptimized, includes debug symbols)
 cargo build
 
-# Build for release (optimized, ~440KB)
+# Build for release (optimized, ~1.6MB)
 cargo build --release
 
 # Install to ~/.cargo/bin/
@@ -95,13 +100,13 @@ tail -f /tmp/mcp-wrapper-mcp-searxng.log
 ### Adding New Features
 
 1. **CLI Arguments**
-   - Add flag matching in `main()` before main loop
+   - Add flag matching in `main()` before runtime creation
    - Pattern: `args[1].starts_with("-")` → `match args[1]` → error on unknown
 
-2. **Subprocess Timeout**
-   - Current: 60 seconds (`SUBPROCESS_TIMEOUT_SECS`)
-   - Configurable via: Environment variable or Cargo feature flag
-   - *WHY: Different MCP servers have different initialization times*
+2. **New ServerHandler methods**
+   - Override in `impl ServerHandler for McpProxy`
+   - For cached responses: return from struct field
+   - For forwarded requests: use `ensure_backend()` → `peer.method()`
 
 3. **Cache Invalidation**
    - Currently: Never invalidated (assumes static tool definitions)
@@ -110,32 +115,34 @@ tail -f /tmp/mcp-wrapper-mcp-searxng.log
 ### Code Style
 
 - Use Rust 2021 idioms
-- Prefer `std::process::Command` over `libc::system`
-- Error handling: Return `Result<T, E>` instead of `panic!`
+- rmcp handles all JSON-RPC protocol details — never hand-parse JSON-RPC
+- Error handling: Return `Result<T, ErrorData>` for ServerHandler methods
 - Comments: Explain WHY, not WHAT
+- Version comes from `env!("CARGO_PKG_VERSION")` — single source of truth in Cargo.toml
 
 ### Performance Constraints
 
 | Metric | Target | Current |
 |--------|--------|---------|
-| Binary size | <500KB | ~440KB ✓ |
+| Binary size | — | ~1.6MB |
 | Startup time | <100ms | ~50ms ✓ |
-| Memory (idle) | <5MB | ~2MB ✓ |
+| Memory (idle) | <5MB | ~3MB ✓ |
 | Tool call latency | +0ms overhead | Meets target ✓ |
 
 ### Common Pitfalls
 
-1. **Subprocess Zombies**
-   - *Problem*: Not calling `.wait()` after `.kill()`
-   - *Solution*: Always `child.kill()` then `child.wait()`
+1. **Subprocess Cleanup**
+   - rmcp's `TokioChildProcess` handles kill-on-drop via `process-wrap` crate
+   - No manual `child.kill()` + `child.wait()` needed
 
-2. **Stdin EOF**
-   - *Problem*: Subprocess hangs waiting for more input
-   - *Solution*: `drop(stdin)` to send EOF after writing requests
+2. **Multi-threaded Runtime**
+   - rmcp's `serve_server` requires `Send + Sync + 'static` on handlers
+   - Uses `tokio::sync::Mutex` (not `std::sync::Mutex`) because lock guard spans await points
+   - Runtime: `new_multi_thread()` — required by rmcp's task spawning
 
-3. **JSON-RPC Protocol**
-   - *Problem*: Forgetting `\n` delimiter between messages
-   - *Solution*: Use `writeln!()` not `write!()`
+3. **Backend Connection**
+   - `ensure_backend()` uses `is_closed()` to detect dead connections
+   - Always clone `Peer` before releasing the mutex guard
 
 ## Testing Checklist
 
@@ -150,17 +157,19 @@ Before releasing a new version:
 - [ ] Wraps Python MCP (test with custom server.py)
 - [ ] Wraps shell script MCP (test with run_server.sh)
 - [ ] Debug logging works (`MCP_WRAPPER_DEBUG=1`)
-- [ ] Binary size <500KB (`ls -lh target/release/mcp-wrapper-rs`)
-- [ ] Update version in `Cargo.toml` and `main.rs`
+- [ ] Consecutive tool calls reuse persistent backend (check log for single "spawning" message)
+- [ ] Update version in `Cargo.toml` (main.rs reads from there via `env!()`)
 
 ## Version History
 
+- **0.2.0** (2026-02-23): Full rewrite using rmcp 0.16 SDK. Persistent backend for tool calls. Pagination support. Protocol handling delegated to rmcp.
+- **0.1.3** (2026-02-xx): Bug fixes for cache and response ordering.
 - **0.1.1** (2026-02-12): Added `--version`, `--help`, unknown flag handling. Fixed silent hang on invalid flags.
 - **0.1.0** (2026-01-25): Initial release. Core proxy functionality, subprocess caching, debug logging.
 
 ## Reminders
 
 - **Release binaries MUST be stripped** (already configured in `Cargo.toml`)
-- **Version numbers MUST match** in `Cargo.toml` and `main.rs`
+- **Version is defined ONLY in `Cargo.toml`** — code reads via `env!("CARGO_PKG_VERSION")`
 - **CLI behavior MUST follow POSIX conventions**: `-h` short flag, `--help` long flag
 - **Error messages go to stderr**, success output to stdout
