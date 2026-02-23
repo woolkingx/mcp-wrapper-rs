@@ -162,7 +162,21 @@ impl McpProxy {
     async fn new(cmd: String, cmd_args: Vec<String>, init_timeout: Duration) -> Result<Self, Box<dyn std::error::Error>> {
         log("init_cache: spawning subprocess via rmcp client");
         let (transport, _stderr_buf) = Self::spawn_child(&cmd, &cmd_args)?;
+        Self::init_from_transport(cmd, cmd_args, transport, init_timeout).await
+    }
 
+    /// Build a proxy by querying an already-created transport.
+    /// Exposed for testing with in-process transports (tokio::io::duplex).
+    pub async fn init_from_transport<T>(
+        cmd: String,
+        cmd_args: Vec<String>,
+        transport: T,
+        init_timeout: Duration,
+    ) -> Result<Self, Box<dyn std::error::Error>>
+    where
+        T: rmcp::transport::Transport<RoleClient> + Send + 'static,
+        T::Error: std::error::Error + Send + Sync + 'static,
+    {
         let client: RunningService<RoleClient, ()> = ().serve(transport).await?;
         let peer = client.peer().clone();
 
