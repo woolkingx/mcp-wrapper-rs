@@ -309,7 +309,7 @@ fn print_usage(program: &str) {
     eprintln!("Options:");
     eprintln!("  --version, -V              Show version and exit");
     eprintln!("  --help, -h                 Show this help and exit");
-    eprintln!("  --init-timeout <secs>      Seconds to wait for prompts/resources during init (default: 30)");
+    eprintln!("  --init-timeout <secs>      Seconds to wait for prompts/resources during init (default: 5)");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {} python3 server.py", program);
@@ -381,7 +381,7 @@ async fn async_main(args: Vec<String>) {
         };
         (Duration::from_secs(secs), 3)
     } else {
-        (Duration::from_secs(30), 1)
+        (Duration::from_secs(5), 1)
     };
 
     if args.len() <= cmd_start {
