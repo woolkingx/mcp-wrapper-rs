@@ -30,7 +30,7 @@ python3 server.py           ~50MB
 
 - **啟動時**：啟動子進程一次，快取 `tools/list`、`prompts/list`、`resources/list`
 - **運行時**：協議查詢從快取即時回應
-- **工具呼叫**：啟動子進程 → 執行 → 返回結果 → 終止子進程
+- **工具呼叫**：維持一個持久化子進程連線，跨呼叫重複使用（失敗時自動重啟）
 
 結果：**4 個 MCP 伺服器僅使用 ~8MB**（原本 ~370MB）
 
@@ -55,7 +55,7 @@ cargo install --path .
 ## 使用方法
 
 ```bash
-mcp-wrapper-rs <命令> [參數...]
+mcp-wrapper-rs [--init-timeout <秒>] <命令> [參數...]
 ```
 
 ### 範例
@@ -69,6 +69,9 @@ mcp-wrapper-rs python3 /path/to/server.py
 
 # 使用環境變數（從父進程繼承）
 SEARXNG_URL=http://localhost:8080 mcp-wrapper-rs npx -y mcp-searxng
+
+# 使用自訂初始化超時（預設 5 秒；啟動較慢的伺服器可調高）
+mcp-wrapper-rs --init-timeout 15 npx -y mcp-searxng
 ```
 
 ### Claude Code 設定
@@ -103,21 +106,22 @@ SEARXNG_URL=http://localhost:8080 mcp-wrapper-rs npx -y mcp-searxng
 ## 運作原理
 
 1. **初始化階段**
-   - 啟動子進程，發送 `initialize` + `tools/list` + `prompts/list` + `resources/list`
-   - 等待 4 個回應（60 秒超時）
-   - 快取所有回應，終止子進程
+   - 啟動子進程，透過 rmcp SDK 完成 MCP 握手
+   - 查詢 `tools/list`、`prompts/list`、`resources/list`、`resources/templates/list`（支援分頁）
+   - 每個查詢有可設定的超時（`--init-timeout`，預設 5 秒）；無回應的伺服器會被跳過
+   - 快取所有結果，終止初始化子進程
 
 2. **運行階段**
    - `initialize` → 從快取即時回應
    - `tools/list` → 從快取即時回應
    - `prompts/list` → 從快取即時回應
    - `resources/list` → 從快取即時回應
-   - `tools/call` → 啟動子進程 → 執行 → 返回 → 終止
+   - `tools/call` → 轉發至持久化後端子進程
 
 3. **資源管理**
-   - 子進程僅在 `tools/call` 執行期間存活
-   - 60 秒超時防止卡住
-   - kill + wait 確保乾淨終止
+   - 持久化後端子進程跨工具呼叫重複使用
+   - 後端進程死亡時，下次呼叫自動重啟
+   - rmcp SDK 負責進程生命週期和協議細節
 
 ## 除錯日誌
 
@@ -127,15 +131,15 @@ SEARXNG_URL=http://localhost:8080 mcp-wrapper-rs npx -y mcp-searxng
 MCP_WRAPPER_DEBUG=1 mcp-wrapper-rs npx -y mcp-searxng
 ```
 
-每個 MCP 伺服器根據推斷的名稱使用獨立的日誌檔：
-- `/tmp/mcp-wrapper-mcp-searxng.log`
-- `/tmp/mcp-wrapper-server.log` (從 `server.py` 推斷)
-- `/tmp/mcp-wrapper-run_server.log` (從 `run_server.sh` 推斷)
+每個 MCP 伺服器根據推斷的名稱使用獨立的日誌檔。日誌位置遵循 XDG Base Directory 規範：
+- `$XDG_RUNTIME_DIR/mcp-wrapper/mcp-searxng.log`（Linux 有 XDG runtime dir 時）
+- `$TMPDIR/mcp-wrapper/mcp-searxng.log`（macOS 或自訂 TMPDIR）
+- `/tmp/mcp-wrapper/mcp-searxng.log`（後備路徑）
 
 可使用 `MCP_SERVER_NAME` 覆蓋名稱：
 ```bash
 MCP_SERVER_NAME=my-custom-name mcp-wrapper-rs python3 server.py
-# 日誌寫入: /tmp/mcp-wrapper-my-custom-name.log
+# 日誌寫入: $XDG_RUNTIME_DIR/mcp-wrapper/my-custom-name.log
 ```
 
 ## 效能對比
@@ -143,7 +147,7 @@ MCP_SERVER_NAME=my-custom-name mcp-wrapper-rs python3 server.py
 | 指標 | 之前 | 之後 |
 |------|------|------|
 | 記憶體（4 個伺服器） | ~370MB | ~8MB |
-| 二進位大小 | N/A | 432KB |
+| 二進位大小 | N/A | ~1.6MB |
 | `tools/list` 延遲 | ~2s | <1ms |
 | `tools/call` 延遲 | 相同 | 相同 |
 
@@ -163,7 +167,7 @@ MCP_SERVER_NAME=my-custom-name mcp-wrapper-rs python3 server.py
 **為何更快**
 - **按需啟動子進程**：進程僅在需要時運行，消除閒置開銷
 - **快取優先設計**：`initialize`、`tools/list`、`prompts/list`、`resources/list` 從記憶體提供
-- **乾淨的資源生命週期**：工具執行完成後立即終止子進程
+- **持久化後端連線**：工具呼叫重複使用同一子進程，首次呼叫後無重啟開銷
 
 ## 相容性
 

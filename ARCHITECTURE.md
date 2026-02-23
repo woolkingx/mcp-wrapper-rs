@@ -108,13 +108,13 @@ Wrapper                              Subprocess (init, temporary)
    │─── rmcp serve_client() ────────────▶│ (rmcp handles handshake)
    │◀── RunningService<RoleClient> ──────│
    │                                     │
-   │─── peer.list_all_tools() ─────────▶│ (handles pagination)
+   │─── peer.list_all_tools() ─────────▶│ (pagination; init_timeout applies)
    │◀── Vec<Tool> ──────────────────────│
-   │─── peer.list_all_prompts() ───────▶│
+   │─── peer.list_all_prompts() ───────▶│ (skipped if timeout expires)
    │◀── Vec<Prompt> ────────────────────│
-   │─── peer.list_all_resources() ─────▶│
+   │─── peer.list_all_resources() ─────▶│ (skipped if timeout expires)
    │◀── Vec<Resource> ──────────────────│
-   │─── peer.list_all_resource_templates() ─▶│
+   │─── peer.list_all_resource_templates() ─▶│ (skipped if timeout expires)
    │◀── Vec<ResourceTemplate> ──────────│
    │                                     │
    │─── drop(client) → graceful_shutdown ▶✗
@@ -134,7 +134,7 @@ async fn ensure_backend(&self) -> Result<Peer<RoleClient>, ErrorData> {
         // Dead connection, will re-spawn below
     }
     // Spawn new subprocess via rmcp client
-    let transport = TokioChildProcess::builder(command).stderr(null).spawn()?;
+    let transport = TokioChildProcess::builder(command).stderr(piped).spawn()?; // captured for error msgs
     let running = ().serve(transport).await?; // rmcp handles handshake
     let peer = running.peer().clone();
     *guard = Some(running);
@@ -153,7 +153,7 @@ rmcp's `TokioChildProcess` handles:
 - Process group management via `process-wrap` crate
 - Kill-on-drop (no zombie processes)
 - Graceful shutdown (close stdin → wait → kill on timeout)
-- stderr suppressed via `Stdio::null()`
+- stderr captured via `Stdio::piped()` and kept in a ring buffer (last 4KB); attached to error responses on backend failure
 
 ## Error Handling
 
@@ -176,4 +176,4 @@ rmcp's `TokioChildProcess` handles:
 
 - [ ] Cache refresh on demand
 - [ ] `tools/listChanged` notification support
-- [ ] Configurable init timeout
+- [x] Configurable init timeout (`--init-timeout`, default 5s)
