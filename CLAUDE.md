@@ -39,10 +39,19 @@ Client → [stdin/stdout] → rmcp serve_server(McpProxy) → ServerHandler trai
 ### Key Files
 ```
 src/
-└── main.rs              # Everything: CLI, McpProxy, ServerHandler impl (~327 lines)
+└── main.rs                   # Everything: CLI, McpProxy, ServerHandler impl (~447 lines)
 
-Cargo.toml              # Dependencies: rmcp (client+server+transport), tokio
-target/release/         # Compiled binary (~1.6MB with strip=true)
+tests/
+├── behavioral.rs             # 12 integration tests: spawn wrapper + Python echo/slow servers
+├── conformance.rs            # 9 MCP schema conformance tests (validates JSON-RPC responses)
+├── support/                  # schema2object (Rust) copied from projects/schema2object/rust/src/
+│   ├── mod.rs                # Module root (uses super:: not crate::)
+│   └── *.rs                  # ObjectTree, validate, compose, defaults, error
+└── fixtures/
+    └── mcp-schema.json       # MCP official schema 2025-03-26 (83 definitions, 89KB)
+
+Cargo.toml                    # Dependencies: rmcp (client+server+transport), tokio
+target/release/               # Compiled binary (~1.6MB with strip=true)
 ```
 
 ### Memory Model
@@ -81,18 +90,18 @@ cargo check
 # Test unknown flag handling
 ./target/release/mcp-wrapper-rs --unknown 2>&1 | grep "Error"
 
-# Test with real MCP server
-./target/release/mcp-wrapper-rs npx -y mcp-searxng
-# In another terminal: echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | nc localhost <port>
+# Test with real MCP server (stdio proxy — pipe JSON directly to wrapper's stdin)
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' \
+  | ./target/release/mcp-wrapper-rs npx -y mcp-searxng
 ```
 
 ### Debug Logging
 ```bash
-# Enable debug logs to /tmp/mcp-wrapper-*.log
+# Enable debug logs (XDG: $XDG_RUNTIME_DIR/mcp-wrapper/, fallback: /tmp/mcp-wrapper/)
 MCP_WRAPPER_DEBUG=1 mcp-wrapper-rs npx -y mcp-searxng
 
-# View logs
-tail -f /tmp/mcp-wrapper-mcp-searxng.log
+# View logs (Linux with XDG runtime dir)
+tail -f /run/user/1000/mcp-wrapper/mcp-searxng.log
 ```
 
 ## Development Guidelines
@@ -100,8 +109,9 @@ tail -f /tmp/mcp-wrapper-mcp-searxng.log
 ### Adding New Features
 
 1. **CLI Arguments**
-   - Add flag matching in `main()` before runtime creation
-   - Pattern: `args[1].starts_with("-")` → `match args[1]` → error on unknown
+   - Add flag matching in `async_main()` before runtime creation
+   - Pattern: `args[i].starts_with("-")` → `match args[i]` → consume value if needed → error on unknown
+   - Current flags: `--init-timeout <secs>` (default 5), `--version`, `--help`
 
 2. **New ServerHandler methods**
    - Override in `impl ServerHandler for McpProxy`
@@ -163,7 +173,7 @@ Before releasing a new version:
 ## Version History
 
 - **0.2.0** (2026-02-23): Full rewrite using rmcp 0.16 SDK. Persistent backend for tool calls. Pagination support. Protocol handling delegated to rmcp.
-- **0.1.3** (2026-02-xx): Bug fixes for cache and response ordering.
+- **0.1.3** (2026-02-18): Bug fixes for cache and response ordering.
 - **0.1.1** (2026-02-12): Added `--version`, `--help`, unknown flag handling. Fixed silent hang on invalid flags.
 - **0.1.0** (2026-01-25): Initial release. Core proxy functionality, subprocess caching, debug logging.
 
