@@ -1,17 +1,15 @@
 [package]
 name = "mcp-wrapper-rs"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-libc = "0.2.180"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1", features = ["rt", "net", "io-util", "io-std", "signal", "macros", "process", "time"] }
+rmcp = { version = "0.16", features = ["client", "server", "transport-child-process", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
 
 [profile.release]
-opt-level = "z"     # 最小體積
+opt-level = "z"     # Minimize binary size
 lto = true          # Link-time optimization
-codegen-units = 1   # 更好優化
-panic = "abort"     # 更小體積
-strip = true        # 移除 debug symbols
+codegen-units = 1   # Better optimization
+panic = "abort"     # Smaller binary
+strip = true        # Remove debug symbols

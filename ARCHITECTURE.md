@@ -6,28 +6,29 @@
 
 The wrapper follows a simple principle: **cache what's static, proxy what's dynamic**.
 
+Built on [rmcp](https://crates.io/crates/rmcp) 0.16 (official Rust MCP SDK), which handles all JSON-RPC protocol details.
+
 ## System Overview
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                        mcp-wrapper-rs                            │
 │                                                                  │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
-│  │   Stdin     │───▶│   Router    │───▶│   Cache (static)    │  │
-│  │  (JSON-RPC) │    │             │    │   - server_info     │  │
-│  └─────────────┘    │             │    │   - capabilities    │  │
-│                     │             │    │   - tools[]         │  │
-│                     │             │    │   - prompts[]       │  │
-│                     │             │    │   - resources[]     │  │
-│                     │             │    └─────────────────────┘  │
-│                     │             │                              │
-│                     │             │    ┌─────────────────────┐  │
-│                     │             │───▶│ Subprocess (dynamic)│  │
-│                     │             │    │   - tools/call      │  │
-│                     └─────────────┘    │   - spawn → exec →  │  │
-│                                        │     response → kill │  │
-│  ┌─────────────┐                       └─────────────────────┘  │
-│  │   Stdout    │◀────────────────────────────────────────────── │
+│  ┌─────────────┐    ┌──────────────────────────────────────┐    │
+│  │   Stdin     │───▶│   McpProxy (ServerHandler trait)     │    │
+│  │  (JSON-RPC) │    │                                      │    │
+│  └─────────────┘    │   initialize → cached ServerInfo     │    │
+│                     │   tools/list → cached ListToolsResult │    │
+│                     │   prompts/list → cached               │    │
+│                     │   resources/list → cached              │    │
+│                     │   resources/templates/list → cached    │    │
+│                     │                                      │    │
+│                     │   tools/call → ensure_backend() ─────│──▶ MCP Server
+│                     │              → peer.call_tool()      │    (persistent)
+│                     └──────────────────────────────────────┘    │
+│                                                                  │
+│  ┌─────────────┐                                                 │
+│  │   Stdout    │◀── rmcp handles response routing ──────────────│
 │  │  (JSON-RPC) │                                                 │
 │  └─────────────┘                                                 │
 └──────────────────────────────────────────────────────────────────┘
@@ -38,168 +39,141 @@ The wrapper follows a simple principle: **cache what's static, proxy what's dyna
 ### Static Requests (Cached)
 
 ```
-Client                  Wrapper                 Subprocess
-  │                        │                        │
-  │─── initialize ────────▶│                        │
-  │◀── cached response ────│                        │
-  │                        │                        │
-  │─── tools/list ────────▶│                        │
-  │◀── cached response ────│                        │
+Client                  Wrapper (McpProxy)
+  │                        │
+  │─── initialize ────────▶│ → returns cached ServerInfo (instant)
+  │◀── response ───────────│
+  │                        │
+  │─── tools/list ────────▶│ → returns cached ListToolsResult (instant)
+  │◀── response ───────────│
 ```
 
-**Latency**: < 1ms
+**Latency**: < 1ms (rmcp handles serialization and id mapping)
 
-### Dynamic Requests (Proxied)
+### Dynamic Requests (Persistent Backend)
 
 ```
-Client                  Wrapper                 Subprocess
+Client                  Wrapper                  Backend (persistent)
   │                        │                        │
   │─── tools/call ────────▶│                        │
-  │                        │─── spawn ─────────────▶│
-  │                        │─── initialize ────────▶│
-  │                        │◀── response ───────────│
-  │                        │─── notification ──────▶│
-  │                        │─── tools/call ────────▶│
-  │                        │◀── response ───────────│
-  │                        │─── kill ──────────────▶│
-  │◀── response ───────────│                        ✗
+  │                        │── ensure_backend() ──▶│ (spawns if needed)
+  │                        │   rmcp client init    │
+  │                        │── peer.call_tool() ──▶│
+  │                        │◀── CallToolResult ────│
+  │◀── response ───────────│                        │ (stays alive)
+  │                        │                        │
+  │─── tools/call ────────▶│── peer.call_tool() ──▶│ (reuses connection)
+  │                        │◀── CallToolResult ────│
+  │◀── response ───────────│                        │
 ```
 
-**Latency**: Same as direct subprocess call
+**Latency**: Same as direct subprocess call (no re-init overhead after first call)
 
 ## Data Structures
 
-### McpCache
+### McpProxy
 
 ```rust
-struct McpCache {
-    server_info: Value,   // From initialize response
-    capabilities: Value,  // From initialize response
-    tools: Value,         // From tools/list response
-    prompts: Value,       // From prompts/list response
-    resources: Value,     // From resources/list response
+struct McpProxy {
+    cmd: String,
+    cmd_args: Vec<String>,
+    // Cached from init phase
+    cached_tools: ListToolsResult,
+    cached_prompts: ListPromptsResult,
+    cached_resources: ListResourcesResult,
+    cached_resource_templates: ListResourceTemplatesResult,
+    server_info: ServerInfo,
+    // Persistent backend connection (lazy-spawned on first tool call)
+    backend: tokio::sync::Mutex<Option<RunningService<RoleClient, ()>>>,
 }
 ```
 
-### Request/Response
+### ServerHandler Trait
 
-```rust
-struct Request {
-    method: Option<String>,
-    id: Option<Value>,      // None = notification (no response needed)
-    params: Option<Value>,
-}
+McpProxy implements `rmcp::ServerHandler`, overriding only:
+- `get_info()` → cached ServerInfo
+- `list_tools()` → cached ListToolsResult
+- `list_prompts()` → cached ListPromptsResult
+- `list_resources()` → cached ListResourcesResult
+- `list_resource_templates()` → cached ListResourceTemplatesResult
+- `call_tool()` → forwarded via persistent backend
 
-struct Response {
-    jsonrpc: &'static str,  // Always "2.0"
-    id: Value,
-    result: Option<Value>,  // Success
-    error: Option<Value>,   // Error
-}
-```
+All other methods (ping, initialize, etc.) use rmcp's default implementations.
 
 ## Initialization Sequence
 
-At startup, wrapper spawns subprocess once to populate cache:
-
 ```
-Wrapper                              Subprocess
+Wrapper                              Subprocess (init, temporary)
    │                                     │
-   │─── spawn ──────────────────────────▶│
+   │─── rmcp serve_client() ────────────▶│ (rmcp handles handshake)
+   │◀── RunningService<RoleClient> ──────│
    │                                     │
-   │─── {"id":0,"method":"initialize"}──▶│
-   │─── {"method":"notifications/init"}─▶│
-   │─── {"id":1,"method":"tools/list"}──▶│
-   │─── {"id":2,"method":"prompts/list"}▶│
-   │─── {"id":3,"method":"resources/list"}▶│
+   │─── peer.list_all_tools() ─────────▶│ (handles pagination)
+   │◀── Vec<Tool> ──────────────────────│
+   │─── peer.list_all_prompts() ───────▶│
+   │◀── Vec<Prompt> ────────────────────│
+   │─── peer.list_all_resources() ─────▶│
+   │◀── Vec<Resource> ──────────────────│
+   │─── peer.list_all_resource_templates() ─▶│
+   │◀── Vec<ResourceTemplate> ──────────│
    │                                     │
-   │◀── {"id":0,"result":{...}} ─────────│
-   │◀── {"id":1,"result":{tools:[...]}}──│
-   │◀── {"id":2,"result":{prompts:[...]}}│
-   │◀── {"id":3,"result":{resources:[]}}─│
-   │                                     │
-   │─── kill ───────────────────────────▶✗
+   │─── drop(client) → graceful_shutdown ▶✗
    │
-   ▼ (cache populated, ready to serve)
+   ▼ (cache populated, ready to serve on stdio)
 ```
+
+## Backend Connection Management
+
+```rust
+async fn ensure_backend(&self) -> Result<Peer<RoleClient>, ErrorData> {
+    let mut guard = self.backend.lock().await;
+    if let Some(ref running) = *guard {
+        if !running.is_closed() {
+            return Ok(running.peer().clone()); // Reuse existing
+        }
+        // Dead connection, will re-spawn below
+    }
+    // Spawn new subprocess via rmcp client
+    let transport = TokioChildProcess::builder(command).stderr(null).spawn()?;
+    let running = ().serve(transport).await?; // rmcp handles handshake
+    let peer = running.peer().clone();
+    *guard = Some(running);
+    Ok(peer)
+}
+```
+
+Key decisions:
+- `tokio::sync::Mutex` because lock guard spans `.await` points
+- `is_closed()` detects dead subprocess → automatic re-spawn
+- `Peer` cloned before releasing lock (cheap Arc-based clone)
 
 ## Subprocess Management
 
-### Spawning
-
-```rust
-Command::new(cmd)
-    .args(args)
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())  // Discard stderr to prevent pollution
-    .spawn()
-```
-
-### Response Collection
-
-The wrapper waits for a specific number of responses:
-
-```rust
-fn run_subprocess(..., expected_responses: usize) -> Vec<Value> {
-    // Write all requests at once
-    stdin.write_all(requests.as_bytes());
-    stdin.flush();
-
-    // Read responses until:
-    // 1. Got expected number of responses with `id` field, OR
-    // 2. Timeout (60 seconds)
-    for line in reader.lines() {
-        if elapsed > timeout { break; }
-        if response.has("id") {
-            responses.push(response);
-            if responses.len() >= expected_responses { break; }
-        }
-        // Skip notifications (no id field)
-    }
-
-    // Cleanup
-    child.kill();
-    child.wait();
-}
-```
-
-### Why Not Close Stdin Early?
-
-Some MCP servers (especially npx-based) exit immediately when stdin closes. We keep stdin open and use explicit kill for reliable termination.
-
-## Method Routing
-
-```rust
-match method.as_str() {
-    "initialize"     => respond_from_cache(),
-    "tools/list"     => respond_from_cache(),
-    "prompts/list"   => respond_from_cache(),
-    "resources/list" => respond_from_cache(),
-    "tools/call"     => spawn_subprocess_and_proxy(),
-    _                => error_method_not_found(),
-}
-```
+rmcp's `TokioChildProcess` handles:
+- Process group management via `process-wrap` crate
+- Kill-on-drop (no zombie processes)
+- Graceful shutdown (close stdin → wait → kill on timeout)
+- stderr suppressed via `Stdio::null()`
 
 ## Error Handling
 
 | Scenario | Behavior |
 |----------|----------|
-| Subprocess spawn fails | Return empty response |
-| Subprocess timeout | Kill and return error |
-| Invalid JSON from subprocess | Skip line, continue |
-| Subprocess dies mid-call | Return error response |
+| Init subprocess fails | Exit with error message |
+| Backend spawn fails | Return ErrorData to client |
+| Backend dies mid-session | Auto re-spawn on next call |
+| Tool call fails | ErrorData propagated to client |
+| rmcp protocol error | Handled by rmcp SDK |
 
 ## Limitations
 
-1. **No streaming**: Responses are collected before returning
+1. **No streaming**: Responses collected before returning
 2. **No subscriptions**: `listChanged` notifications not supported
 3. **Cache invalidation**: Tools list cached at startup only
-4. **Single subprocess**: No connection pooling
+4. **Single backend**: One persistent subprocess for all tool calls
 
 ## Future Improvements
 
-- [ ] Configurable timeout
-- [ ] Optional subprocess pooling for high-frequency calls
 - [ ] Cache refresh on demand
-- [ ] Metrics/statistics endpoint
+- [ ] `tools/listChanged` notification support
+- [ ] Configurable init timeout
