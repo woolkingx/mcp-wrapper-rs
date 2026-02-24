@@ -14,7 +14,11 @@
    - *WHY: Subprocess timing is environment-specific*
    - Test matrix: npx (searxng, fetcher), Python servers, shell scripts
 
-4. **Language Policy: All code and docs MUST be in English**
+4. **MUST diff-review all agent-generated code before committing**
+   - *WHY: Agents (haiku/sub-agents) add unplanned changes that break functionality*
+   - Pattern: `git diff` → verify only planned changes exist → revert unplanned additions
+
+5. **Language Policy: All code and docs MUST be in English**
    - *WHY: Public GitHub project for global open-source community*
    - Exception: Localized docs with language suffix (`README-zh.md`, `ARCHITECTURE-ja.md`)
 
@@ -50,8 +54,8 @@ tests/
 └── fixtures/
     └── mcp-schema.json       # MCP official schema 2025-03-26 (83 definitions, 89KB)
 
-Cargo.toml                    # Dependencies: rmcp (client+server+transport), tokio
-target/release/               # Compiled binary (~1.6MB with strip=true)
+Cargo.toml                    # Dependencies: rmcp, tokio, tracing, tracing-subscriber, tracing-appender
+target/release/               # Compiled binary (~2.2MB with strip=true)
 ```
 
 ### Memory Model
@@ -97,11 +101,18 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 
 ### Debug Logging
 ```bash
-# Enable debug logs (XDG: $XDG_RUNTIME_DIR/mcp-wrapper/, fallback: /tmp/mcp-wrapper/)
+# Enable INFO-level logs
 MCP_WRAPPER_DEBUG=1 mcp-wrapper-rs npx -y mcp-searxng
 
+# Enable DEBUG-level logs (most verbose)
+MCP_WRAPPER_DEBUG=debug mcp-wrapper-rs npx -y mcp-searxng
+
+# Log file naming: mcp-wrapper-{name}-{hash8}.log
+# hash8 = first 8 hex chars of hash(cmd + args), guarantees uniqueness
+# Override with: MCP_SERVER_NAME=my-server → mcp-wrapper-my-server.log
+
 # View logs (Linux with XDG runtime dir)
-tail -f /run/user/1000/mcp-wrapper/mcp-searxng.log
+tail -f /run/user/1000/mcp-wrapper/mcp-wrapper-mcp-searxng-*.log
 ```
 
 ## Development Guidelines
@@ -109,7 +120,7 @@ tail -f /run/user/1000/mcp-wrapper/mcp-searxng.log
 ### Adding New Features
 
 1. **CLI Arguments**
-   - Add flag matching in `async_main()` before runtime creation
+   - Add flag matching in `main()` before runtime creation
    - Pattern: `args[i].starts_with("-")` → `match args[i]` → consume value if needed → error on unknown
    - Current flags: `--init-timeout <secs>` (default 5), `--version`, `--help`
 
@@ -127,6 +138,7 @@ tail -f /run/user/1000/mcp-wrapper/mcp-searxng.log
 - Use Rust 2021 idioms
 - rmcp handles all JSON-RPC protocol details — never hand-parse JSON-RPC
 - Error handling: Return `Result<T, ErrorData>` for ServerHandler methods
+- Logging: Use `tracing` macros (`info!`, `debug!`, `warn!`) — never hand-rolled `log()` or `println!`
 - Comments: Explain WHY, not WHAT
 - Version comes from `env!("CARGO_PKG_VERSION")` — single source of truth in Cargo.toml
 
@@ -134,7 +146,7 @@ tail -f /run/user/1000/mcp-wrapper/mcp-searxng.log
 
 | Metric | Target | Current |
 |--------|--------|---------|
-| Binary size | — | ~1.6MB |
+| Binary size | — | ~2.2MB |
 | Startup time | <100ms | ~50ms ✓ |
 | Memory (idle) | <5MB | ~3MB ✓ |
 | Tool call latency | +0ms overhead | Meets target ✓ |
