@@ -512,20 +512,6 @@ async fn async_main(args: Vec<String>) {
         }
     };
 
-    let ct = server.cancellation_token();
-    tokio::select! {
-        _ = server.waiting() => {
-            info!("server stopped");
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("signal: SIGINT");
-            ct.cancel();
-        }
-        _ = sigterm_recv!() => {
-            info!("signal: SIGTERM");
-            ct.cancel();
-        }
-    }
-
+    let _ = server.waiting().await;
     info!("shutdown");
 }
