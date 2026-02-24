@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 rmcp = { version = "0.16", features = ["client", "server", "transport-child-process", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
 
 [dev-dependencies]
 anyhow = "1"

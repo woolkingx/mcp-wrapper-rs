@@ -15,34 +15,18 @@ use rmcp::{
     service::{RequestContext, RoleClient, RoleServer, RunningService, Peer},
     transport::{TokioChildProcess, io::stdio},
 };
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::future::Future;
-use std::fs::OpenOptions;
-use std::io::Write as IoWrite;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-
-static LOG_FILE: OnceLock<String> = OnceLock::new();
-static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
-
-fn is_debug() -> bool {
-    *DEBUG_ENABLED.get_or_init(|| env::var("MCP_WRAPPER_DEBUG").is_ok())
-}
-
-fn log(msg: &str) {
-    if !is_debug() {
-        return;
-    }
-    if let Some(log_file) = LOG_FILE.get() {
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_file) {
-            let _ = writeln!(f, "{}", msg);
-        }
-    }
-}
+use tracing::{debug, info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
 
 /// Resolve log directory: $XDG_RUNTIME_DIR/mcp-wrapper > $TMPDIR > /tmp
 fn log_dir() -> String {
@@ -56,6 +40,46 @@ fn log_dir() -> String {
         return tmp;
     }
     "/tmp".to_string()
+}
+
+/// Compute 8-char hex hash from cmd + args for unique log file naming.
+fn cmd_hash(cmd: &str, args: &[String]) -> String {
+    let mut h = DefaultHasher::new();
+    cmd.hash(&mut h);
+    args.hash(&mut h);
+    format!("{:016x}", h.finish())[..8].to_string()
+}
+
+/// Initialize tracing to file if MCP_WRAPPER_DEBUG is set.
+/// Returns WorkerGuard that must be kept alive for the duration of the program.
+/// Level: MCP_WRAPPER_DEBUG=1 or =info → INFO+, =debug → DEBUG+
+fn init_tracing(cmd: &str, args: &[String]) -> Option<WorkerGuard> {
+    let level_str = env::var("MCP_WRAPPER_DEBUG").ok()?;
+
+    let level = match level_str.to_lowercase().as_str() {
+        "debug" => "debug",
+        _ => "info", // "1", "info", or anything else → INFO
+    };
+
+    let file_name = if let Ok(name) = env::var("MCP_SERVER_NAME") {
+        format!("mcp-wrapper-{}.log", sanitize_name(&name))
+    } else {
+        let name = infer_mcp_name(cmd, args);
+        let hash = cmd_hash(cmd, args);
+        format!("mcp-wrapper-{}-{}.log", name, hash)
+    };
+
+    let appender = tracing_appender::rolling::never(log_dir(), &file_name);
+    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_env_filter(format!("mcp_wrapper_rs={}", level))
+        .with_target(false)
+        .with_thread_ids(false)
+        .init();
+
+    Some(guard)
 }
 
 fn infer_mcp_name(cmd: &str, args: &[String]) -> String {
@@ -96,7 +120,7 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
-/// Spawn a stderr reader task that tees output to the log file and a shared buffer.
+/// Spawn a stderr reader task that tees output to tracing and a shared buffer.
 /// The buffer holds the last ~4KB of stderr for error reporting.
 fn spawn_stderr_reader(
     mut stderr: tokio::process::ChildStderr,
@@ -110,16 +134,12 @@ fn spawn_stderr_reader(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let text = String::from_utf8_lossy(&chunk[..n]);
-                    // Tee to log file
-                    if is_debug() {
-                        for line in text.lines() {
-                            log(&format!("[stderr] {}", line));
-                        }
+                    for line in text.lines() {
+                        warn!(line, "backend stderr");
                     }
                     // Keep last ~4KB in buffer for error reporting
                     if let Ok(mut guard) = buf_clone.lock() {
                         guard.push_str(&text);
-                        // Trim to avoid unbounded growth
                         if guard.len() > 4096 {
                             let trim_at = guard.len() - 4096;
                             *guard = guard[trim_at..].to_string();
@@ -160,7 +180,7 @@ impl McpProxy {
     }
 
     async fn new(cmd: String, cmd_args: Vec<String>, init_timeout: Duration) -> Result<Self, Box<dyn std::error::Error>> {
-        log("init_cache: spawning subprocess via rmcp client");
+        debug!("init: spawning subprocess");
         let (transport, _stderr_buf) = Self::spawn_child(&cmd, &cmd_args)?;
         Self::init_from_transport(cmd, cmd_args, transport, init_timeout).await
     }
@@ -185,33 +205,37 @@ impl McpProxy {
         // and will silently ignore the request, causing a hang without a timeout.
         let tools = tokio::time::timeout(init_timeout, peer.list_all_tools())
             .await.ok().and_then(|r| r.ok()).unwrap_or_default();
-        log(&format!("cached {} tools", tools.len()));
         let cached_tools = ListToolsResult::with_all_items(tools);
 
         let prompts = tokio::time::timeout(init_timeout, peer.list_all_prompts())
             .await.ok().and_then(|r| r.ok()).unwrap_or_default();
-        log(&format!("cached {} prompts", prompts.len()));
         let cached_prompts = ListPromptsResult::with_all_items(prompts);
 
         let resources = tokio::time::timeout(init_timeout, peer.list_all_resources())
             .await.ok().and_then(|r| r.ok()).unwrap_or_default();
-        log(&format!("cached {} resources", resources.len()));
         let cached_resources = ListResourcesResult::with_all_items(resources);
 
         let resource_templates = tokio::time::timeout(init_timeout, peer.list_all_resource_templates())
             .await.ok().and_then(|r| r.ok()).unwrap_or_default();
-        log(&format!("cached {} resource_templates", resource_templates.len()));
         let cached_resource_templates = ListResourceTemplatesResult::with_all_items(resource_templates);
 
         // Cache server info from the initialize handshake
         let server_info = peer.peer_info()
             .cloned()
             .unwrap_or_default();
-        log(&format!("server_info: {:?}", server_info.server_info));
+
+        debug!(
+            tools = cached_tools.tools.len(),
+            prompts = cached_prompts.prompts.len(),
+            resources = cached_resources.resources.len(),
+            resource_templates = cached_resource_templates.resource_templates.len(),
+            server = ?server_info.server_info,
+            "init: cached"
+        );
 
         // Shutdown init subprocess
         drop(client);
-        log("init subprocess shutdown");
+        debug!("init: shutdown");
 
         Ok(Self {
             cmd,
@@ -231,10 +255,10 @@ impl McpProxy {
             if !running.is_closed() {
                 return Ok((running.peer().clone(), stderr_buf.clone()));
             }
-            log("backend connection died, re-spawning");
+            warn!("backend: died, respawning");
         }
 
-        log("spawning persistent backend subprocess");
+        info!("backend: spawned");
         let (transport, stderr_buf) = Self::spawn_child(&self.cmd, &self.cmd_args)
             .map_err(|e| ErrorData::internal_error(format!("spawn backend: {}", e), None))?;
 
@@ -258,7 +282,6 @@ impl ServerHandler for McpProxy {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
-        log("[handler] list_tools → from cache");
         std::future::ready(Ok(self.cached_tools.clone()))
     }
 
@@ -267,7 +290,6 @@ impl ServerHandler for McpProxy {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListPromptsResult, ErrorData>> + Send + '_ {
-        log("[handler] list_prompts → from cache");
         std::future::ready(Ok(self.cached_prompts.clone()))
     }
 
@@ -276,7 +298,6 @@ impl ServerHandler for McpProxy {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
-        log("[handler] list_resources → from cache");
         std::future::ready(Ok(self.cached_resources.clone()))
     }
 
@@ -285,8 +306,14 @@ impl ServerHandler for McpProxy {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, ErrorData>> + Send + '_ {
-        log("[handler] list_resource_templates → from cache");
         std::future::ready(Ok(self.cached_resource_templates.clone()))
+    }
+
+    fn ping(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), ErrorData>> + Send + '_ {
+        std::future::ready(Ok(()))
     }
 
     fn call_tool(
@@ -295,9 +322,15 @@ impl ServerHandler for McpProxy {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResult, ErrorData>> + Send + '_ {
         async move {
-            log(&format!("[handler] call_tool: {}", request.name));
+            let name = request.name.clone();
+            let args_str = request.arguments.as_ref()
+                .map(|v| format!("{:?}", v))
+                .unwrap_or_default();
+            let t0 = std::time::Instant::now();
+            info!(name = %name, args = %args_str, "call_tool");
+
             let (peer, stderr_buf) = self.ensure_backend().await?;
-            peer.call_tool(request).await.map_err(|e| {
+            let result = peer.call_tool(request).await.map_err(|e| {
                 // Attach stderr output to the error message for easier diagnosis
                 let stderr = stderr_buf.lock()
                     .ok()
@@ -308,7 +341,18 @@ impl ServerHandler for McpProxy {
                     format!("backend call_tool: {}{}", e, stderr),
                     None,
                 )
-            })
+            });
+
+            if let Ok(ref r) = result {
+                let result_str = format!("{:?}", r);
+                let truncated = if result_str.len() > 500 {
+                    format!("{}...{}", &result_str[..200], &result_str[result_str.len()-200..])
+                } else {
+                    result_str
+                };
+                info!(name = %name, elapsed_ms = t0.elapsed().as_millis(), result = %truncated, "call_tool done");
+            }
+            result
         }
     }
 }
@@ -408,40 +452,80 @@ async fn async_main(args: Vec<String>) {
     let cmd = args[cmd_start].clone();
     let cmd_args: Vec<String> = args[cmd_start + 1..].to_vec();
 
-    // Initialize log file
-    let mcp_name = infer_mcp_name(&cmd, &cmd_args);
-    let log_path = format!("{}/mcp-wrapper-{}-{}.log", log_dir(), mcp_name, std::process::id());
-    let _ = LOG_FILE.set(log_path.clone());
+    // Initialize tracing
+    let _tracing_guard = init_tracing(&cmd, &cmd_args);
 
-    if is_debug() {
-        log(&format!("=== MCP Wrapper v{} started (rmcp) ===", env!("CARGO_PKG_VERSION")));
-        log(&format!("cmd: {} args: {:?}", cmd, cmd_args));
-        log(&format!("init_timeout: {}s", init_timeout.as_secs()));
+    info!(cmd = %cmd, args = ?cmd_args, init_timeout_secs = init_timeout.as_secs(), version = env!("CARGO_PKG_VERSION"), "started");
+
+    // Register signal handlers BEFORE init_cache (mirrors v0.1.2 design).
+    // Claude Code sends SIGINT on exit. If we only poll signals after serve(),
+    // a SIGINT during init hits unguarded code → process::exit → OS closes
+    // pipes abruptly → Claude Code's stdio onclose fires → marks "failed".
+    // By arming signals first we can return cleanly at any phase.
+    //
+    // SIGTERM is Unix-only. On non-Unix, sigterm_recv() returns a future that
+    // never resolves (std::future::pending), so the branch never fires.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate()
+    ).expect("failed to register SIGTERM handler");
+
+    macro_rules! sigterm_recv {
+        () => {{
+            #[cfg(unix)] { sigterm.recv() }
+            #[cfg(not(unix))] { std::future::pending::<Option<()>>() }
+        }}
     }
 
-    // Build proxy with cached server info
-    let proxy = match McpProxy::new(cmd, cmd_args, init_timeout).await {
-        Ok(p) => p,
+    // Build proxy — race against signals so init is interruptible.
+    let proxy = tokio::select! {
+        result = McpProxy::new(cmd, cmd_args, init_timeout) => {
+            match result {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(err = %e, "init failed");
+                    eprintln!("Error: Failed to initialize MCP server: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("signal: SIGINT during init");
+            info!("shutdown");
+            return; // clean return — drops tokio runtime, closes pipes gracefully
+        }
+        _ = sigterm_recv!() => {
+            info!("signal: SIGTERM during init");
+            info!("shutdown");
+            return;
+        }
+    };
+
+    info!("serving");
+
+    let server = match proxy.serve(stdio()).await {
+        Ok(s) => s,
         Err(e) => {
-            log(&format!("init failed: {}", e));
-            eprintln!("Error: Failed to initialize MCP server: {}", e);
+            warn!(err = %e, "serve error");
+            eprintln!("Error: Failed to start server: {}", e);
             std::process::exit(1);
         }
     };
 
-    log("serving via rmcp on stdio");
-
-    // Serve on stdin/stdout — rmcp handles the full JSON-RPC protocol
-    match proxy.serve(stdio()).await {
-        Ok(server) => {
-            let _ = server.waiting().await;
+    let ct = server.cancellation_token();
+    tokio::select! {
+        _ = server.waiting() => {
+            info!("server stopped");
         }
-        Err(e) => {
-            log(&format!("serve error: {}", e));
-            eprintln!("Error: Failed to start server: {}", e);
-            std::process::exit(1);
+        _ = tokio::signal::ctrl_c() => {
+            info!("signal: SIGINT");
+            ct.cancel();
+        }
+        _ = sigterm_recv!() => {
+            info!("signal: SIGTERM");
+            ct.cancel();
         }
     }
 
-    log("shutdown complete");
+    info!("shutdown");
 }
