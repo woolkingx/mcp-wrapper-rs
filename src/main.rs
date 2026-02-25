@@ -12,7 +12,7 @@
 use rmcp::{
     ServerHandler, ServiceExt,
     model::*,
-    service::{RequestContext, RoleClient, RoleServer, RunningService},
+    service::{RequestContext, RoleClient, RoleServer, RunningService, ServiceError},
     transport::{TokioChildProcess, io::stdio},
 };
 use std::collections::hash_map::DefaultHasher;
@@ -21,11 +21,12 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 
@@ -123,6 +124,13 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Spawn a stderr reader task that tees output to tracing and a shared buffer.
 /// The buffer holds the last ~4KB of stderr for error reporting.
 fn spawn_stderr_reader(
@@ -145,12 +153,11 @@ fn spawn_stderr_reader(
                         debug!(line, "backend stderr");
                     }
                     // Keep last ~4KB in buffer for error reporting
-                    if let Ok(mut guard) = buf_clone.lock() {
-                        guard.push_str(&text);
-                        if guard.len() > 4096 {
-                            let trim_at = guard.len() - 4096;
-                            *guard = guard[trim_at..].to_string();
-                        }
+                    let mut guard = buf_clone.lock().await;
+                    guard.push_str(&text);
+                    if guard.len() > 4096 {
+                        let trim_at = guard.len() - 4096;
+                        *guard = guard[trim_at..].to_string();
                     }
                 }
             }
@@ -163,7 +170,13 @@ fn spawn_stderr_reader(
 
 const BACKEND_IDLE_SECS: u64 = 60;
 
-type Backend = tokio::sync::Mutex<Option<(RunningService<RoleClient, ()>, Arc<Mutex<String>>)>>;
+enum BackendState {
+    Empty,
+    Spawning(Arc<tokio::sync::Notify>),
+    Ready(RunningService<RoleClient, ()>, Arc<Mutex<String>>),
+}
+
+type Backend = tokio::sync::Mutex<BackendState>;
 
 struct McpProxy {
     cmd: String,
@@ -174,8 +187,9 @@ struct McpProxy {
     cached_resources: ListResourcesResult,
     cached_resource_templates: ListResourceTemplatesResult,
     server_info: ServerInfo,
+    backend_capabilities: ServerCapabilities,
     backend: Arc<Backend>,
-    idle_notify: Arc<tokio::sync::Notify>,
+    last_activity: Arc<AtomicU64>,
     active_calls: Arc<AtomicUsize>,
 }
 
@@ -276,16 +290,35 @@ impl McpProxy {
         let cached_resource_templates = ListResourceTemplatesResult::with_all_items(resource_templates);
 
         // Cache server info from the initialize handshake
-        let server_info = peer.peer_info()
+        let backend_server_info = peer.peer_info()
             .cloned()
             .unwrap_or_default();
+        let mut server_info = backend_server_info.clone();
+        let backend_capabilities = backend_server_info.capabilities.clone();
+        // Advertise only capabilities implemented by this proxy.
+        // For now: tools only.
+        server_info.capabilities = ServerCapabilities {
+            tools: backend_capabilities.tools.clone(),
+            ..ServerCapabilities::default()
+        };
+
+        if backend_capabilities.tools.is_some() && cached_tools.tools.is_empty() {
+            warn!("init: tools capability advertised but list empty - capability may be stale");
+        }
+        if backend_capabilities.prompts.is_some() && cached_prompts.prompts.is_empty() {
+            warn!("init: prompts capability advertised but list empty - capability may be stale");
+        }
+        if backend_capabilities.resources.is_some() && cached_resources.resources.is_empty() {
+            warn!("init: resources capability advertised but list empty - capability may be stale");
+        }
 
         debug!(
             tools = cached_tools.tools.len(),
             prompts = cached_prompts.prompts.len(),
             resources = cached_resources.resources.len(),
             resource_templates = cached_resource_templates.resource_templates.len(),
-            server = ?server_info.server_info,
+            server = ?backend_server_info.server_info,
+            advertised_capabilities = ?server_info.capabilities,
             "init: cached"
         );
 
@@ -298,8 +331,9 @@ impl McpProxy {
             cached_resources,
             cached_resource_templates,
             server_info,
-            backend: Arc::new(tokio::sync::Mutex::new(Some((client, stderr_buf)))),
-            idle_notify: Arc::new(tokio::sync::Notify::new()),
+            backend_capabilities,
+            backend: Arc::new(tokio::sync::Mutex::new(BackendState::Ready(client, stderr_buf))),
+            last_activity: Arc::new(AtomicU64::new(now_millis())),
             active_calls: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -309,45 +343,93 @@ impl McpProxy {
     /// All subprocess operations use init_timeout as the unified timeout.
     /// Backend is killed after BACKEND_IDLE_SECS of inactivity.
     async fn ensure_backend(&self) -> Result<(rmcp::service::Peer<RoleClient>, Arc<Mutex<String>>), ErrorData> {
-        let mut guard = self.backend.lock().await;
-        if let Some((ref running, ref stderr_buf)) = *guard {
-            if !running.is_closed() {
-                debug!("backend: reusing");
-                return Ok((running.peer().clone(), stderr_buf.clone()));
+        loop {
+            enum Next {
+                Wait(Arc<tokio::sync::Notify>),
+                Spawn(Arc<tokio::sync::Notify>),
             }
-            warn!("backend: died, respawning");
+
+            let next = {
+                let mut guard = self.backend.lock().await;
+                match &*guard {
+                    BackendState::Ready(running, stderr_buf) => {
+                        if !running.is_closed() {
+                            debug!("backend: reusing");
+                            return Ok((running.peer().clone(), stderr_buf.clone()));
+                        }
+                        warn!("backend: died, respawning");
+                        let notify = Arc::new(tokio::sync::Notify::new());
+                        *guard = BackendState::Spawning(notify.clone());
+                        Next::Spawn(notify)
+                    }
+                    BackendState::Spawning(notify) => {
+                        Next::Wait(notify.clone())
+                    }
+                    BackendState::Empty => {
+                        let notify = Arc::new(tokio::sync::Notify::new());
+                        *guard = BackendState::Spawning(notify.clone());
+                        Next::Spawn(notify)
+                    }
+                }
+            };
+
+            match next {
+                Next::Wait(notify) => {
+                    notify.notified().await;
+                }
+                Next::Spawn(notify) => {
+                    info!("backend: spawning");
+                    let (transport, stderr_buf) = match Self::spawn_child(&self.cmd, &self.cmd_args) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(err = %e, "backend: spawn failed");
+                            let mut guard = self.backend.lock().await;
+                            *guard = BackendState::Empty;
+                            notify.notify_waiters();
+                            return Err(ErrorData::internal_error(format!("spawn: {}", e), None));
+                        }
+                    };
+
+                    let running_result = tokio::time::timeout(
+                        self.init_timeout,
+                        ().serve(transport),
+                    ).await
+                        .map_err(|_| {
+                            warn!(timeout_secs = self.init_timeout.as_secs(), "backend: init timeout");
+                            ErrorData::internal_error("backend init timeout", None)
+                        });
+                    let running: RunningService<RoleClient, ()> = match running_result {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
+                            warn!(err = %e, "backend: init failed");
+                            let mut guard = self.backend.lock().await;
+                            *guard = BackendState::Empty;
+                            notify.notify_waiters();
+                            return Err(ErrorData::internal_error(format!("backend init: {}", e), None));
+                        }
+                        Err(err_data) => {
+                            let mut guard = self.backend.lock().await;
+                            *guard = BackendState::Empty;
+                            notify.notify_waiters();
+                            return Err(err_data);
+                        }
+                    };
+                    info!("backend: ready");
+
+                    let peer = running.peer().clone();
+                    let buf = stderr_buf.clone();
+                    let mut guard = self.backend.lock().await;
+                    *guard = BackendState::Ready(running, stderr_buf);
+                    notify.notify_waiters();
+                    return Ok((peer, buf));
+                }
+            }
         }
-
-        info!("backend: spawning");
-        let (transport, stderr_buf) = Self::spawn_child(&self.cmd, &self.cmd_args)
-            .map_err(|e| {
-                warn!(err = %e, "backend: spawn failed");
-                ErrorData::internal_error(format!("spawn: {}", e), None)
-            })?;
-
-        let running: RunningService<RoleClient, ()> = tokio::time::timeout(
-            self.init_timeout,
-            ().serve(transport),
-        ).await
-            .map_err(|_| {
-                warn!(timeout_secs = self.init_timeout.as_secs(), "backend: init timeout");
-                ErrorData::internal_error("backend init timeout", None)
-            })?
-            .map_err(|e| {
-                warn!(err = %e, "backend: init failed");
-                ErrorData::internal_error(format!("backend init: {}", e), None)
-            })?;
-        info!("backend: ready");
-
-        let peer = running.peer().clone();
-        let buf = stderr_buf.clone();
-        *guard = Some((running, stderr_buf));
-        Ok((peer, buf))
     }
 
     /// Reset the idle timer. Call after each tool call completes.
     fn touch_idle(&self) {
-        self.idle_notify.notify_one();
+        self.last_activity.store(now_millis(), Ordering::Relaxed);
     }
 }
 
@@ -358,33 +440,41 @@ impl ServerHandler for McpProxy {
 
     fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
+        // Cursor ignored: all items are preloaded at init time.
+        let _ = request;
         std::future::ready(Ok(self.cached_tools.clone()))
     }
 
     fn list_prompts(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListPromptsResult, ErrorData>> + Send + '_ {
+        // Cursor ignored: all items are preloaded at init time.
+        let _ = request;
         std::future::ready(Ok(self.cached_prompts.clone()))
     }
 
     fn list_resources(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
+        // Cursor ignored: all items are preloaded at init time.
+        let _ = request;
         std::future::ready(Ok(self.cached_resources.clone()))
     }
 
     fn list_resource_templates(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, ErrorData>> + Send + '_ {
+        // Cursor ignored: all items are preloaded at init time.
+        let _ = request;
         std::future::ready(Ok(self.cached_resource_templates.clone()))
     }
 
@@ -402,40 +492,132 @@ impl ServerHandler for McpProxy {
     ) -> impl Future<Output = Result<CallToolResult, ErrorData>> + Send + '_ {
         async move {
             let name = request.name.clone();
-            let args_str = request.arguments.as_ref()
-                .map(|v| format!("{:?}", v))
-                .unwrap_or_default();
-            let arg_size = args_str.len();
+            let arg_keys = request.arguments.as_ref()
+                .map(|v| v.len())
+                .unwrap_or(0);
             let t0 = std::time::Instant::now();
-            info!(name = %name, arg_size = arg_size, "call_tool");
-            debug!(name = %name, args = %args_str, "call_tool args");
+            info!(name = %name, arg_keys = arg_keys, "call_tool");
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let args_str = format!("{:?}", request.arguments);
+                debug!(name = %name, args = %args_str, "call_tool args");
+            }
 
             let _active_call_guard = ActiveCallGuard::new(self.active_calls.clone());
-            self.touch_idle();
             let (peer, stderr_buf) = self.ensure_backend().await?;
 
             // No wrapper timeout — client decides how long to wait.
             // If backend dies, peer.call_tool() returns Err (pipe broken).
-            let result = peer.call_tool(request).await.map_err(|e| {
-                let stderr = stderr_buf.lock()
-                    .ok()
-                    .and_then(|g| if g.is_empty() { None } else { Some(g.clone()) })
+            let result = match peer.call_tool(request).await {
+                Ok(v) => Ok(v),
+                Err(ServiceError::McpError(err_data)) => Err(err_data),
+                Err(other) => {
+                    let stderr = {
+                        let g = stderr_buf.lock().await;
+                        if g.is_empty() { None } else { Some(g.clone()) }
+                    }
                     .map(|s| format!("\nstderr: {}", s.trim()))
                     .unwrap_or_default();
-                ErrorData::internal_error(format!("call_tool: {}{}", e, stderr), None)
-            });
+                    Err(ErrorData::internal_error(format!("call_tool: {}{}", other, stderr), None))
+                }
+            };
 
             let elapsed = t0.elapsed().as_millis();
             match &result {
                 Ok(r) => {
-                    let result_str = format!("{:?}", r);
-                    let result_size = result_str.len();
-                    info!(name = %name, elapsed_ms = elapsed, arg_size = arg_size, result_size = result_size, "call_tool done");
-                    debug!(name = %name, result = %result_str, "call_tool result");
+                    let result_size = r.content.len();
+                    info!(name = %name, elapsed_ms = elapsed, arg_keys = arg_keys, result_size = result_size, "call_tool done");
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        let result_str = format!("{:?}", r);
+                        debug!(name = %name, result = %result_str, "call_tool result");
+                    }
                 }
                 Err(ref e) => {
                     warn!(name = %name, elapsed_ms = elapsed, err = %e.message, "call_tool failed");
                 }
+            }
+            self.touch_idle();
+            result
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResult, ErrorData>> + Send + '_ {
+        async move {
+            if self.backend_capabilities.resources.is_none() {
+                return Err(ErrorData::method_not_found::<ReadResourceRequestMethod>());
+            }
+            let uri = request.uri.clone();
+            info!(uri = %uri, "read_resource");
+            let t0 = std::time::Instant::now();
+            let _active_call_guard = ActiveCallGuard::new(self.active_calls.clone());
+            let (peer, _stderr_buf) = self.ensure_backend().await?;
+            let result = peer.read_resource(request).await.map_err(|e| match e {
+                ServiceError::McpError(err_data) => err_data,
+                other => ErrorData::internal_error(format!("read_resource: {}", other), None),
+            });
+            let elapsed = t0.elapsed().as_millis();
+            match &result {
+                Ok(_) => info!(uri = %uri, elapsed_ms = elapsed, "read_resource done"),
+                Err(e) => warn!(uri = %uri, elapsed_ms = elapsed, err = %e.message, "read_resource failed"),
+            }
+            self.touch_idle();
+            result
+        }
+    }
+
+    fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetPromptResult, ErrorData>> + Send + '_ {
+        async move {
+            if self.backend_capabilities.prompts.is_none() {
+                return Err(ErrorData::method_not_found::<GetPromptRequestMethod>());
+            }
+            let name = request.name.clone();
+            info!(name = %name, "get_prompt");
+            let t0 = std::time::Instant::now();
+            let _active_call_guard = ActiveCallGuard::new(self.active_calls.clone());
+            let (peer, _stderr_buf) = self.ensure_backend().await?;
+            let result = peer.get_prompt(request).await.map_err(|e| match e {
+                ServiceError::McpError(err_data) => err_data,
+                other => ErrorData::internal_error(format!("get_prompt: {}", other), None),
+            });
+            let elapsed = t0.elapsed().as_millis();
+            match &result {
+                Ok(_) => info!(name = %name, elapsed_ms = elapsed, "get_prompt done"),
+                Err(e) => warn!(name = %name, elapsed_ms = elapsed, err = %e.message, "get_prompt failed"),
+            }
+            self.touch_idle();
+            result
+        }
+    }
+
+    fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CompleteResult, ErrorData>> + Send + '_ {
+        async move {
+            if self.backend_capabilities.completions.is_none() {
+                return Err(ErrorData::method_not_found::<CompleteRequestMethod>());
+            }
+            let arg_name = request.argument.name.clone();
+            info!(argument = %arg_name, "complete");
+            let t0 = std::time::Instant::now();
+            let _active_call_guard = ActiveCallGuard::new(self.active_calls.clone());
+            let (peer, _stderr_buf) = self.ensure_backend().await?;
+            let result = peer.complete(request).await.map_err(|e| match e {
+                ServiceError::McpError(err_data) => err_data,
+                other => ErrorData::internal_error(format!("complete: {}", other), None),
+            });
+            let elapsed = t0.elapsed().as_millis();
+            match &result {
+                Ok(_) => info!(argument = %arg_name, elapsed_ms = elapsed, "complete done"),
+                Err(e) => warn!(argument = %arg_name, elapsed_ms = elapsed, err = %e.message, "complete failed"),
             }
             self.touch_idle();
             result
@@ -609,7 +791,7 @@ async fn async_main(args: Vec<String>) {
 
     // Grab Arc handles before proxy is moved into serve()
     let backend_handle = proxy.backend.clone();
-    let idle_handle = proxy.idle_notify.clone();
+    let last_activity_handle = proxy.last_activity.clone();
     let active_calls_handle = proxy.active_calls.clone();
 
     let server = match proxy.serve(stdio()).await {
@@ -620,34 +802,23 @@ async fn async_main(args: Vec<String>) {
             std::process::exit(1);
         }
     };
-    idle_handle.notify_one();
-
     // Idle reaper: kill backend after BACKEND_IDLE_SECS of inactivity
     tokio::spawn(async move {
         loop {
-            // Wait for first activity, then start idle countdown
-            idle_handle.notified().await;
-            debug!("idle: timer started");
-            loop {
-                let timeout = tokio::time::timeout(
-                    Duration::from_secs(BACKEND_IDLE_SECS),
-                    idle_handle.notified(),
-                ).await;
-                if timeout.is_err() {
-                    // Timed out — but don't kill if calls are in flight
-                    if active_calls_handle.load(Ordering::Relaxed) > 0 {
-                        debug!("idle: calls in flight, deferring");
-                        continue; // reset timer, check again later
-                    }
-                    let mut guard = backend_handle.lock().await;
-                    if guard.is_some() {
-                        info!("backend: idle timeout, shutting down");
-                        *guard = None; // drop kills the subprocess
-                    }
-                    break; // back to waiting for first activity
-                }
-                // Got notified — reset timer
-                debug!("idle: timer reset");
+            tokio::time::sleep(Duration::from_secs(BACKEND_IDLE_SECS)).await;
+            let now = now_millis();
+            let last = last_activity_handle.load(Ordering::Relaxed);
+            let idle_for = now.saturating_sub(last);
+            if idle_for < BACKEND_IDLE_SECS * 1000 {
+                continue;
+            }
+            if active_calls_handle.load(Ordering::Relaxed) > 0 {
+                continue;
+            }
+            let mut guard = backend_handle.lock().await;
+            if let BackendState::Ready(_, _) = &*guard {
+                info!("backend: idle timeout, shutting down");
+                *guard = BackendState::Empty; // drop kills the subprocess
             }
         }
     });
