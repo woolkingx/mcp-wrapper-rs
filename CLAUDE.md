@@ -43,25 +43,42 @@ Client → [stdin/stdout] → rmcp serve_server(McpProxy) → ServerHandler trai
 ### Key Files
 ```
 src/
-└── main.rs                   # Everything: CLI, McpProxy, ServerHandler impl (~447 lines)
+└── main.rs                   # Everything: CLI, McpProxy, ServerHandler impl
 
 tests/
-├── behavioral.rs             # 12 integration tests: spawn wrapper + Python echo/slow servers
-├── conformance.rs            # 9 MCP schema conformance tests (validates JSON-RPC responses)
+├── behavioral.rs             # Integration tests: spawn wrapper + Python echo/slow servers
+├── conformance.rs            # MCP schema conformance tests (validates JSON-RPC responses)
+├── schema_driven.rs          # SDD tests: derived from mcp-proxy-tests.json x-tests tags
 ├── support/                  # schema2object (Rust) copied from projects/schema2object/rust/src/
 │   ├── mod.rs                # Module root (uses super:: not crate::)
 │   └── *.rs                  # ObjectTree, validate, compose, defaults, error
 └── fixtures/
-    └── mcp-schema.json       # MCP official schema 2025-03-26 (83 definitions, 89KB)
+    ├── mcp-schema.json       # MCP official schema 2025-03-26 (83 definitions, 89KB)
+    └── mcp-proxy-tests.json  # SDD companion schema: x-methods + x-tests for proxy behaviors
 
 Cargo.toml                    # Dependencies: rmcp, tokio, tracing, tracing-subscriber, tracing-appender
 target/release/               # Compiled binary (~2.2MB with strip=true)
 ```
 
 ### Memory Model
-- **Startup**: Spawn once → rmcp client handshake → `list_all_tools/prompts/resources` (with pagination) → cache → kill subprocess
+- **Startup**: Spawn once → rmcp client handshake → `list_all_tools/prompts/resources` (parallel, 5s list_timeout each) → cache → **keep client alive as first backend**
 - **Runtime**: Serve `initialize`/`tools/list`/`prompts/list`/`resources/list` from cache (instant, rmcp handles id/protocol)
-- **Tool execution**: Lazy spawn persistent backend → forward via `peer.call_tool()` → reuse connection for subsequent calls
+- **Tool execution**: `ensure_backend()` → clone `Peer` → release lock → `peer.call_tool()` outside lock → reuse for subsequent calls
+- **Idle reaper**: AtomicU64 timestamp, sleep-loop every 60s, kills backend only when `active_calls == 0`; loop runs for process lifetime
+
+### Concurrency Design (rmcp internals)
+- `Peer` contains only `mpsc::Sender` — `clone()` is cheap (Arc-based)
+- `peer.call_tool()` sends request into `mpsc::channel(1024)`, awaits `oneshot` response
+- rmcp event loop matches responses by JSON-RPC `id` — **full concurrent multiplexing on one connection**
+- **No connection pool needed**: multiple concurrent `call_tool` callers each clone `Peer`, all in-flight simultaneously
+- Mutex held only during `ensure_backend()` to clone `Peer` — NOT during the actual call
+
+### BackendState Machine
+```
+Empty → Spawning(Notify) → Ready(RunningService, stderr_buf)
+          ↑ concurrent callers wait on Notify
+          ↑ on spawn failure: reset to Empty + notify_waiters (prevent hang)
+```
 
 ## Key Commands
 
@@ -159,12 +176,40 @@ tail -f /run/user/1000/mcp-wrapper/mcp-wrapper-mcp-searxng-*.log
 
 2. **Multi-threaded Runtime**
    - rmcp's `serve_server` requires `Send + Sync + 'static` on handlers
-   - Uses `tokio::sync::Mutex` (not `std::sync::Mutex`) because lock guard spans await points
+   - MUST use `tokio::sync::Mutex` (not `std::sync::Mutex`) — lock guard spans `.await` points
    - Runtime: `new_multi_thread()` — required by rmcp's task spawning
 
 3. **Backend Connection**
    - `ensure_backend()` uses `is_closed()` to detect dead connections
    - Always clone `Peer` before releasing the mutex guard
+   - `BackendState::Spawning` error path MUST reset to `Empty` + `notify_waiters()` — otherwise concurrent callers hang
+
+4. **Idle Reaper**
+   - MUST NOT `break` after killing backend — reaper loop runs for process lifetime
+   - Use `AtomicU64` timestamp (not `Notify`) — `Notify` is edge-triggered and loses wakeups under burst
+   - `ActiveCallGuard` (RAII, AtomicUsize) prevents reaper from killing mid-call backend
+
+5. **Hot Path Allocations**
+   - Wrap `format!("{:?}", ...)` in `if tracing::enabled!(Level::DEBUG)` — unconditional format allocates even when debug is off
+   - Use `v.len()` (key count) for `arg_keys` in info! log — zero allocation
+
+## Testing Strategy (Schema-Driven Development)
+
+Tests derive from schema — not hand-written from memory.
+
+**Three test layers:**
+| File | Purpose | Driver |
+|------|---------|--------|
+| `behavioral.rs` | Black-box process tests (CLI flags, basic MCP flow) | Manual |
+| `conformance.rs` | JSON-RPC response conformance against mcp-schema.json | MCP schema |
+| `schema_driven.rs` | Proxy-specific behaviors (concurrency, error codes, reaper) | mcp-proxy-tests.json |
+
+**Adding new behavior tests:**
+1. Add entry to `tests/fixtures/mcp-proxy-tests.json` under `x-tests` with scenario tags
+2. Implement test in `schema_driven.rs` matching that tag
+3. Schema = spec; test = derived proof
+
+**Standard scenario tags:** `null`, `missing`, `empty`, `min_boundary`, `max_boundary`, `valid_normal`, `valid_edge`, `custom:<description>`
 
 ## Testing Checklist
 
@@ -184,6 +229,7 @@ Before releasing a new version:
 
 ## Version History
 
+- **0.2.0** (2026-02-25): Async concurrency overhaul + MCP compliance fixes. BackendState machine, spawn-outside-lock, AtomicU64 reaper, ActiveCallGuard RAII, init backend reuse, tokio::Mutex for stderr, hot-path alloc guards. Capabilities filtering, error code preservation, read_resource/get_prompt/complete forwarding. SDD test suite added.
 - **0.2.0** (2026-02-23): Full rewrite using rmcp 0.16 SDK. Persistent backend for tool calls. Pagination support. Protocol handling delegated to rmcp.
 - **0.1.3** (2026-02-18): Bug fixes for cache and response ordering.
 - **0.1.1** (2026-02-12): Added `--version`, `--help`, unknown flag handling. Fixed silent hang on invalid flags.
