@@ -1,46 +1,34 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "McpProxyTestSpec",
-  "type": "object",
   "x-docs": {
     "intent": "Test specifications for mcp-wrapper-rs proxy behaviors not covered by MCP schema itself.",
     "category": "testing"
   },
   "x-methods": {
-    "ensure_backend": {
-      "description": "Lazy spawn persistent backend subprocess. Reuses connection if alive."
-    },
-    "idle_reaper": {
-      "description": "Kill backend after BACKEND_IDLE_SECS inactivity. Loop persists for process lifetime."
-    },
-    "call_tool": {
-      "description": "Forward tool call to backend peer. Preserve error codes. No wrapper timeout."
-    },
-    "capabilities_filter": {
-      "description": "Advertise only capabilities proxy implements (tools only)."
-    }
+    "ensure_backend": { "description": "Lazy spawn persistent backend subprocess" },
+    "idle_reaper": { "description": "Kill backend after BACKEND_IDLE_SECS inactivity" },
+    "call_tool": { "description": "Forward tool call to backend peer" },
+    "capabilities_filter": { "description": "Advertise only implemented capabilities" }
   },
   "x-tests": {
-    "ensure_backend": [
-      "valid_normal",
-      "custom:spawn_failure",
-      "custom:concurrent_callers",
-      "custom:dead_backend_respawn"
-    ],
-    "idle_reaper": [
-      "custom:reaper_persists_after_kill",
-      "custom:active_call_defers_kill"
-    ],
-    "call_tool": [
-      "valid_normal",
-      "missing",
-      "empty",
-      "custom:backend_error_code_preserved",
-      "custom:concurrent_calls"
-    ],
-    "capabilities_filter": [
-      "valid_normal",
-      "custom:tools_only_advertised"
-    ]
+    "ensure_backend": ["valid_normal", "custom:spawn_failure", "custom:concurrent_callers", "custom:dead_backend_respawn"],
+    "idle_reaper": ["custom:reaper_persists_after_kill", "custom:active_call_defers_kill"],
+    "call_tool": ["valid_normal", "missing", "empty", "custom:backend_error_code_preserved", "custom:concurrent_calls"],
+    "capabilities_filter": ["valid_normal", "custom:tools_only_advertised"],
+
+    "initialize": ["valid_normal"],
+    "ping": ["valid_normal"],
+    "resources/list": ["valid_normal"],
+    "resources/templates/list": ["valid_normal"],
+    "resources/read": ["valid_normal"],
+    "resources/subscribe": ["valid_normal"],
+    "resources/unsubscribe": ["valid_normal"],
+    "prompts/list": ["valid_normal"],
+    "prompts/get": ["valid_normal"],
+    "tools/list": ["valid_normal"],
+    "tools/call": ["valid_normal"],
+    "logging/setLevel": ["valid_normal"],
+    "completion/complete": ["valid_normal"]
   }
 }
