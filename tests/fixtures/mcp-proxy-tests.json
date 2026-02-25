@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpProxyTestSpec",
+  "type": "object",
+  "x-docs": {
+    "intent": "Test specifications for mcp-wrapper-rs proxy behaviors not covered by MCP schema itself.",
+    "category": "testing"
+  },
+  "x-methods": {
+    "ensure_backend": {
+      "description": "Lazy spawn persistent backend subprocess. Reuses connection if alive."
+    },
+    "idle_reaper": {
+      "description": "Kill backend after BACKEND_IDLE_SECS inactivity. Loop persists for process lifetime."
+    },
+    "call_tool": {
+      "description": "Forward tool call to backend peer. Preserve error codes. No wrapper timeout."
+    },
+    "capabilities_filter": {
+      "description": "Advertise only capabilities proxy implements (tools only)."
+    }
+  },
+  "x-tests": {
+    "ensure_backend": [
+      "valid_normal",
+      "custom:spawn_failure",
+      "custom:concurrent_callers",
+      "custom:dead_backend_respawn"
+    ],
+    "idle_reaper": [
+      "custom:reaper_persists_after_kill",
+      "custom:active_call_defers_kill"
+    ],
+    "call_tool": [
+      "valid_normal",
+      "missing",
+      "empty",
+      "custom:backend_error_code_preserved",
+      "custom:concurrent_calls"
+    ],
+    "capabilities_filter": [
+      "valid_normal",
+      "custom:tools_only_advertised"
+    ]
+  }
+}
