@@ -1,10 +1,12 @@
 [package]
 name = "mcp-wrapper-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [dependencies]
 rmcp = { version = "0.16", features = ["client", "server", "transport-child-process", "transport-io"] }
+process-wrap = { version = "9", features = ["tokio1"] }
+libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
