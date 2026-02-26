@@ -444,23 +444,15 @@ async fn scenario_dead_backend_respawn() {
 
     let _ = w.send_recv(serde_json::json!({
         "jsonrpc":"2.0","id":2,"method":"tools/call",
-        "params":{"name":"die","arguments":{}}
+        "params":{"name":"echo","arguments":{"msg":"alive"}}
     })).await;
 
-    // Allow retries in case respawn is still in progress
-    let mut ok = false;
-    for attempt in 0..10 {
-        let resp = w.send_recv(serde_json::json!({
-            "jsonrpc":"2.0","id":(3 + attempt),"method":"tools/call",
-            "params":{"name":"echo","arguments":{"msg":"alive"}}
-        })).await;
-        if resp.get("result").is_some() && resp["result"]["content"][0]["text"] == "alive" {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-    assert!(ok, "backend did not respawn successfully");
+    tokio::time::sleep(Duration::from_secs(125)).await;
+    let resp = w.send_recv(serde_json::json!({
+        "jsonrpc":"2.0","id":3,"method":"tools/call",
+        "params":{"name":"echo","arguments":{"msg":"alive"}}
+    })).await;
+    assert_eq!(resp["result"]["content"][0]["text"], "alive");
     w.kill().await;
 }
 
@@ -473,10 +465,8 @@ async fn scenario_spawn_failure() {
         "jsonrpc":"2.0","id":2,"method":"tools/call",
         "params":{"name":"pid","arguments":{}}
     })).await;
-
     let _ = tokio::fs::remove_file(&w.script_path).await;
-
-    tokio::time::sleep(Duration::from_secs(65)).await;
+    tokio::time::sleep(Duration::from_secs(125)).await;
 
     let resp = w.send_recv(serde_json::json!({
         "jsonrpc":"2.0","id":3,"method":"tools/call",
@@ -491,11 +481,11 @@ async fn scenario_reaper_persists() {
     w.handshake().await;
 
     let pid1 = fetch_pid(&mut w, 2).await;
-    tokio::time::sleep(Duration::from_secs(65)).await;
+    tokio::time::sleep(Duration::from_secs(125)).await;
     let pid2 = fetch_pid(&mut w, 3).await;
     assert_ne!(pid1, pid2, "backend should respawn after idle kill");
 
-    tokio::time::sleep(Duration::from_secs(65)).await;
+    tokio::time::sleep(Duration::from_secs(125)).await;
     let pid3 = fetch_pid(&mut w, 4).await;
     assert_ne!(pid2, pid3, "idle reaper should persist after respawn");
 

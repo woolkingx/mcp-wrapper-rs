@@ -229,6 +229,7 @@ Before releasing a new version:
 
 ## Version History
 
+- **0.2.1** (2026-02-26): Fix orphan subprocess leak. Process group isolation via `ProcessGroup::leader()`, deterministic `killpg` on shutdown. Added `process-wrap` + `libc` as explicit deps.
 - **0.2.0** (2026-02-25): Async concurrency overhaul + MCP compliance fixes. BackendState machine, spawn-outside-lock, AtomicU64 reaper, ActiveCallGuard RAII, init backend reuse, tokio::Mutex for stderr, hot-path alloc guards. Capabilities filtering, error code preservation, read_resource/get_prompt/complete forwarding. SDD test suite added.
 - **0.2.0** (2026-02-23): Full rewrite using rmcp 0.16 SDK. Persistent backend for tool calls. Pagination support. Protocol handling delegated to rmcp.
 - **0.1.3** (2026-02-18): Bug fixes for cache and response ordering.

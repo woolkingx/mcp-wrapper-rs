@@ -386,6 +386,8 @@ name = "mcp-wrapper-rs"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "libc",
+ "process-wrap",
  "regex",
  "rmcp",
  "serde",
