@@ -22,9 +22,6 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             name: macos-x86_64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: windows-x86_64
 
     runs-on: ${{ matrix.os }}
 
@@ -43,18 +40,10 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../mcp-wrapper-rs-${{ matrix.name }}.tar.gz mcp-wrapper-rs
-          cd ../../..
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../mcp-wrapper-rs-${{ matrix.name }}.zip mcp-wrapper-rs.exe
           cd ../../..
 
       - name: Upload artifact
