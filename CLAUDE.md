@@ -10,9 +10,9 @@
 | agent-review | agent writes code | `git diff` → verify only planned changes | agents add unplanned breakage |
 | english-only | write code/docs | all English, exception: `*-zh.md` suffix | public GitHub, global community |
 | process-group | spawn child | `ProcessGroup::leader()` + track pgid | orphan leak without it |
-| shutdown-kill | wrapper exits | `libc::kill(-pgid, SIGKILL)` before `async_main` returns | rmcp drop uses `tokio::spawn` which fails during runtime shutdown |
+| shutdown-kill | wrapper exits | `libc::kill(-pgid, SIGKILL)` before `async_main` returns | async drop is unreliable during runtime shutdown |
 | mutex-type | lock spans `.await` | `tokio::sync::Mutex`, never `std::sync::Mutex` | std Mutex blocks runtime |
-| backend-error | spawn fails in `Spawning` state | reset to `Empty` + `notify_waiters()` | concurrent callers hang otherwise |
+| backend-error | spawn fails | retry up to 3 attempts with exponential backoff | transient failures should not be permanent |
 | reaper-loop | idle reaper | never `break` — loop runs for process lifetime | must keep checking after kill |
 | hot-path-alloc | `format!` in log | guard with `tracing::enabled!(Level::DEBUG)` | allocates even when debug off |
 | version-source | read version | `env!("CARGO_PKG_VERSION")` only — Cargo.toml is source of truth | prevents version drift |
@@ -20,64 +20,65 @@
 ## Architecture
 
 ```
-Client → [stdin/stdout] → rmcp serve_server(McpProxy) → ServerHandler trait
-                                   ↓ (on tools/call)
-                          McpProxy.ensure_backend()
-                                   ↓
-                          rmcp serve_client(TokioChildProcess) → real MCP server
-                          (wrapped in ProcessGroup::leader())
+Client → [stdin/stdout] → main.rs event loop → Router
+                                    ↓
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+                  Cache          PassThru      Notifications
+                (list/*, init)  (tools/call,  (bidirectional
+                                 resources/read, relay)
+                                 prompts/get...)
+                                    ↓
+                              proxy::Backend
+                                    ↓
+                              child subprocess
 ```
 
-### McpProxy Design
+### Module Design
 
-- Implements `rmcp::ServerHandler` — rmcp handles full JSON-RPC protocol
-- **Startup**: spawn subprocess → cache tools/prompts/resources/resource_templates → keep as first backend
-- **Serve**: list requests served from cache (instant)
-- **Tool call**: `ensure_backend()` → clone `Peer` → release lock → `peer.call_tool()` outside lock
-- **Recovery**: `is_closed()` check → auto-respawn
+- **transport.rs**: Raw JSON-RPC line protocol — read/write/build messages over stdin/stdout
+- **router.rs**: Method dispatch — classifies requests as Cached, PassThrough, or Notification
+- **cache.rs**: Init sequence — spawns subprocess, queries all list endpoints, caches results; supports invalidation via `listChanged` notifications
+- **proxy.rs**: Backend lifecycle — `Option<Backend>` with lazy spawn, oneshot request/response matching, process group isolation
+- **main.rs**: CLI parsing, signal handling, event loop orchestrating router + cache + proxy
+
+### Backend Lifecycle
+
+- **Lazy spawn**: Backend created on first pass-through request, not at startup
+- **Retry**: 3 attempts with exponential backoff on spawn failure
+- **Health check**: verify child process alive before forwarding
+- **Graceful shutdown**: SIGTERM → 5s wait → SIGKILL
 - **Cleanup**: each child in own process group, `child_pgids` registry, killpg on exit
 
-### BackendState Machine
+### Concurrency
 
-```
-Empty → Spawning(Notify) → Ready(RunningService, stderr_buf)
-          ↑ concurrent callers wait on Notify
-          ↑ on failure: reset to Empty + notify_waiters
-```
-
-### Concurrency (rmcp internals)
-
-- `Peer` = `mpsc::Sender` (Arc) — clone is cheap, full concurrent multiplexing
-- No connection pool needed — multiple `call_tool` in flight on one connection
-- Mutex held only during `ensure_backend()` to clone `Peer`, NOT during call
+- Oneshot channels for request/response matching (client ID remapped to backend ID)
+- `tokio::sync::Mutex` for backend access (lock spans `.await`)
+- Bidirectional notification relay between client and backend
 
 ## Conventions
 
 | area | pattern |
 |------|---------|
-| error handling | `Result<T, ErrorData>` for ServerHandler methods |
+| error handling | JSON-RPC error responses with standard error codes |
 | logging | `tracing` macros only — never `println!` or hand-rolled `log()` |
 | comments | explain WHY, not WHAT |
-| JSON-RPC | delegate to rmcp — never hand-parse |
+| JSON-RPC | raw protocol handling via `transport.rs` — build/parse messages directly |
 | CLI flags | match in `main()` before runtime: `--init-timeout <secs>` (default 30), `--version`, `--help` |
-| new ServerHandler method | cached → return struct field; forwarded → `ensure_backend()` + `peer.method()` |
-| idle reaper | `AtomicU64` timestamp, not `Notify` (edge-triggered, loses wakeups under burst) |
-| active call guard | `ActiveCallGuard` RAII (AtomicUsize) prevents reaper from killing mid-call |
+| new method support | cached → add to `router.rs` Cached variant + `cache.rs`; forwarded → add PassThrough variant |
+| ID remapping | client ID saved, replaced with monotonic backend ID, restored on response |
 | child pgids | `Arc<std::sync::Mutex<Vec<u32>>>` — std Mutex is correct here (sync-only access) |
 
-## Testing Strategy (Schema-Driven)
-
-Tests derive from schema — not hand-written from memory.
+## Testing Strategy
 
 | file | purpose | driver |
 |------|---------|--------|
-| `behavioral.rs` | black-box process tests (CLI, basic MCP flow) | manual |
-| `conformance.rs` | JSON-RPC response conformance | `mcp-schema.json` |
-| `schema_driven.rs` | proxy-specific behaviors (concurrency, error codes, reaper) | `mcp-proxy-tests.json` |
+| `conformance.rs` | JSON-RPC response conformance against MCP schema | `mcp-schema.json` |
+| `integration.rs` | End-to-end proxy tests with echo_server.py fixture | manual |
 
-**Adding tests**: add entry to `mcp-proxy-tests.json` under `x-tests` → implement in `schema_driven.rs`
+**Conformance tests**: validate response structure using schema2object against `mcp-schema.json`
 
-**Scenario tags**: `null`, `missing`, `empty`, `min_boundary`, `max_boundary`, `valid_normal`, `valid_edge`, `custom:<desc>`
+**Integration tests**: standalone `echo_server.py` fixture for full request/response cycle
 
 ## Release Checklist
 
@@ -94,5 +95,5 @@ Tests derive from schema — not hand-written from memory.
 - **Release binaries MUST be stripped** (configured in `Cargo.toml` `[profile.release]`)
 - **Error messages → stderr**, JSON-RPC output → stdout
 - **CLI follows POSIX**: `-h`/`-V` short flags, `--help`/`--version` long flags
-- **Cache never invalidated** — assumes static tool definitions (future: `tools/listChanged`)
-- **rmcp drop is unreliable** — always kill process groups explicitly before runtime shutdown
+- **Cache invalidation supported** — responds to `tools/list_changed`, `prompts/list_changed`, `resources/list_changed` notifications
+- **Always kill process groups explicitly** before runtime shutdown — async drop is unreliable

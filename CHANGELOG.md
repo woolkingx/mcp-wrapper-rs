@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.3.0] - 2026-03-05
+
+### Changed
+
+- Replaced rmcp SDK with raw JSON-RPC protocol handling
+- Modularized into 5 focused modules: transport, router, cache, proxy, main
+- Advertise ALL backend capabilities (not just tools)
+- Bidirectional notification relay (backend to client and client to backend)
+- Cache invalidation on tools/list_changed, prompts/list_changed, resources/list_changed
+- Lazy backend spawn with 3-attempt exponential backoff retry
+- Graceful backend shutdown: SIGTERM then 5s wait then SIGKILL
+- Full MCP handshake on lazy backend spawn
+
+### Removed
+
+- rmcp SDK dependency
+- x-tests JSON spec (mcp-proxy-tests.json)
+- Old test files (behavioral.rs, schema_driven.rs)
+
+### Added
+
+- Conformance tests using schema2object against mcp-schema.json
+- Integration tests with standalone echo_server.py fixture
+- ID remapping for pass-through requests (client ID mapped to backend ID)
+
 ## [0.2.1] - 2026-02-26
 
 ### Fixed
