@@ -9,6 +9,7 @@ use tracing::debug;
 
 /// Classified JSON-RPC message.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // fields used for structural classification, not all read by callers
 pub enum JsonRpcMessage {
     Request {
         id: Value,
@@ -159,9 +160,5 @@ pub fn build_notification(method: &str, params: Option<Value>) -> Value {
 
 /// Standard JSON-RPC error codes.
 pub mod error_codes {
-    pub const PARSE_ERROR: i64 = -32700;
-    pub const INVALID_REQUEST: i64 = -32600;
-    pub const METHOD_NOT_FOUND: i64 = -32601;
-    pub const INVALID_PARAMS: i64 = -32602;
     pub const INTERNAL_ERROR: i64 = -32603;
 }

@@ -21,7 +21,8 @@ pub type ChildPgids = Arc<std::sync::Mutex<Vec<u32>>>;
 pub struct Backend {
     child_stdin: Arc<Mutex<BufWriter<tokio::process::ChildStdin>>>,
     pending: Arc<Mutex<HashMap<serde_json::Value, oneshot::Sender<serde_json::Value>>>>,
-    notification_tx: mpsc::UnboundedSender<serde_json::Value>,
+    // Held to keep the channel alive; notifications are sent via the clone in the reader task
+    _notification_tx: mpsc::UnboundedSender<serde_json::Value>,
     pgid: u32,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
@@ -137,7 +138,7 @@ impl Backend {
         Ok(Self {
             child_stdin: Arc::new(Mutex::new(BufWriter::new(stdin))),
             pending,
-            notification_tx,
+            _notification_tx: notification_tx,
             pgid,
             next_id: AtomicU64::new(1),
             alive,
@@ -216,11 +217,6 @@ impl Backend {
         serde_json::Value::Number(
             self.next_id.fetch_add(1, Ordering::Relaxed).into(),
         )
-    }
-
-    /// Process group ID of the child.
-    pub fn pgid(&self) -> u32 {
-        self.pgid
     }
 
     /// Access the last ~4KB of child stderr output for error reporting.
