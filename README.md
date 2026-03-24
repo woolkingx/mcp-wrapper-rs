@@ -106,22 +106,21 @@ Edit `~/.claude.json`:
 ## How It Works
 
 1. **Initialization Phase**
-   - Spawns subprocess, performs MCP handshake via rmcp SDK
-   - Queries `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list` (with pagination)
-   - Each query has a configurable timeout (`--init-timeout`, default 5s); unresponsive servers are skipped
+   - Spawns subprocess, performs raw JSON-RPC MCP handshake
+   - Queries `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`
+   - Each query has a configurable timeout (`--init-timeout`, default 30s); unresponsive servers are skipped
    - Caches all results, kills init subprocess
 
 2. **Runtime Phase**
    - `initialize` → Instant response from cache
-   - `tools/list` → Instant response from cache
-   - `prompts/list` → Instant response from cache
-   - `resources/list` → Instant response from cache
-   - `tools/call` → Forwarded to persistent backend subprocess
+   - `tools/list`, `prompts/list`, `resources/list` → Instant response from cache
+   - `tools/call`, `resources/read`, `prompts/get` → Forwarded to persistent backend subprocess
+   - Notifications relayed bidirectionally between client and backend
 
 3. **Resource Management**
-   - Persistent backend subprocess reused across tool calls
-   - Dead backend auto-respawns on next call
-   - rmcp SDK handles process lifecycle and protocol details
+   - Persistent backend subprocess reused across calls
+   - Dead backend auto-respawns with exponential backoff retry
+   - Cache invalidation on `listChanged` notifications
 
 ## Debug Logging
 

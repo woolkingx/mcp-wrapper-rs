@@ -131,21 +131,25 @@ fn empty_result_for(key: &CacheKey) -> Value {
     }
 }
 
-/// Spawn a backend, run MCP initialize handshake, query supported list
-/// methods, and build a populated Cache. Returns both the cache and the
-/// live backend.
+/// Spawn a temporary backend, run the MCP initialize handshake, query
+/// supported list methods, and return a populated Cache.
 ///
 /// Only capabilities declared in the server's InitializeResult are queried.
 /// Unsupported capabilities get spec-compliant empty results immediately.
 /// Each list query uses a short timeout (LIST_QUERY_TIMEOUT) — these target
 /// a local subprocess that already completed init.
-async fn init_cache_inner(
+pub async fn init_cache(
     cmd: &str,
     args: &[String],
     init_timeout: Duration,
     child_pgids: &ChildPgids,
-    notif_tx: mpsc::UnboundedSender<Value>,
-) -> Result<(Cache, Backend), Box<dyn std::error::Error>> {
+) -> Result<Cache, Box<dyn std::error::Error>> {
+    // Notification channel — we discard backend notifications during init
+    let (notif_tx, mut notif_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while notif_rx.recv().await.is_some() {}
+    });
+
     let backend = Backend::spawn(cmd, args, notif_tx, child_pgids)?;
     debug!("init_cache: backend spawned");
 
@@ -243,42 +247,12 @@ async fn init_cache_inner(
         "init_cache: cached"
     );
 
-    let cache = Cache::new(CachedData {
+    // Kill the temporary init backend
+    backend.kill().await;
+
+    Ok(Cache::new(CachedData {
         responses,
         server_info,
         capabilities,
-    });
-
-    Ok((cache, backend))
-}
-
-/// Spawn a temporary backend, build cache, then kill the backend.
-/// Used by normal (non-daemon) mode where the backend is lazily spawned later.
-pub async fn init_cache(
-    cmd: &str,
-    args: &[String],
-    init_timeout: Duration,
-    child_pgids: &ChildPgids,
-) -> Result<Cache, Box<dyn std::error::Error>> {
-    // Notification channel — we discard backend notifications during init
-    let (notif_tx, mut notif_rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while notif_rx.recv().await.is_some() {}
-    });
-
-    let (cache, backend) = init_cache_inner(cmd, args, init_timeout, child_pgids, notif_tx).await?;
-    backend.kill().await;
-    Ok(cache)
-}
-
-/// Spawn a backend, build cache, and keep the backend alive.
-/// Used by daemon/broker mode to reuse the init backend for serving requests.
-pub async fn init_cache_with_backend(
-    cmd: &str,
-    args: &[String],
-    init_timeout: Duration,
-    child_pgids: &ChildPgids,
-    notif_tx: mpsc::UnboundedSender<Value>,
-) -> Result<(Cache, Backend), Box<dyn std::error::Error>> {
-    init_cache_inner(cmd, args, init_timeout, child_pgids, notif_tx).await
+    }))
 }

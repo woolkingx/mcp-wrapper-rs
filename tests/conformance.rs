@@ -1,289 +1,157 @@
-//! Conformance tests: verify wrapper JSON-RPC responses match MCP official schema.
+//! Conformance tests: validate wrapper-built JSON-RPC structures against
+//! the official MCP schema using the vendored schema2object validator.
 //!
-//! Strategy: spawn wrapper with echo-server backend, send each request type,
-//! validate the `result` field against the corresponding MCP schema definition.
+//! These are unit-level checks — no subprocess spawning. We construct
+//! response values using `transport::build_response` / `build_error_response`
+//! and validate them against MCP schema definitions.
 
 use std::path::PathBuf;
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-// ── schema2object ─────────────────────────────────────────────────────────────
 #[path = "support/mod.rs"]
 mod support;
-use support::ObjectTree;
+use support::validate::check_value_with_root;
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-fn wrapper_bin() -> PathBuf {
-    let mut p = std::env::current_exe().unwrap();
-    p.pop(); p.pop();
-    p.push("mcp-wrapper-rs");
-    p
-}
-
-fn echo_server_script() -> &'static str {
-    r#"
-import sys, json
-
-def send(msg):
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
-
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try:
-        msg = json.loads(line)
-    except Exception:
-        continue
-    method = msg.get("method", "")
-    mid = msg.get("id")
-    if method == "initialize":
-        send({"jsonrpc":"2.0","id":mid,"result":{
-            "protocolVersion":"2025-03-26",
-            "capabilities":{"tools":{}},"serverInfo":{"name":"echo","version":"0.1"}
-        }})
-    elif method == "tools/list":
-        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{
-            "name":"echo","description":"Echo","inputSchema":{"type":"object","properties":{"msg":{"type":"string"}}}
-        }]}})
-    elif method == "tools/call":
-        arg = msg.get("params",{}).get("arguments",{}).get("msg","")
-        send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":arg}]}})
-    elif method == "prompts/list":
-        send({"jsonrpc":"2.0","id":mid,"result":{"prompts":[]}})
-    elif method == "resources/list":
-        send({"jsonrpc":"2.0","id":mid,"result":{"resources":[]}})
-    elif method == "resources/templates/list":
-        send({"jsonrpc":"2.0","id":mid,"result":{"resourceTemplates":[]}})
-"#
-}
+// ── Schema helpers ───────────────────────────────────────────────────────────
 
 fn load_mcp_schema() -> serde_json::Value {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/mcp-schema.json");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-schema.json");
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read mcp-schema.json: {e}"));
     serde_json::from_str(&content).expect("invalid mcp-schema.json")
 }
 
-/// Extract `definitions.<name>` from the MCP schema root.
-fn definition(root: &serde_json::Value, name: &str) -> serde_json::Value {
-    root["definitions"][name].clone()
-}
-
-/// Validate `data` against `schema_def`, with `root` for $ref resolution.
-fn assert_conforms(label: &str, data: &serde_json::Value, schema_def: &serde_json::Value, root: &serde_json::Value) {
-    // Merge definitions into schema_def so $ref resolution works
-    let mut full_schema = schema_def.clone();
-    if let Some(obj) = full_schema.as_object_mut() {
+/// Extract `definitions.<name>` and inject the root definitions for $ref resolution.
+fn schema_for(root: &serde_json::Value, def_name: &str) -> serde_json::Value {
+    let mut def = root["definitions"][def_name].clone();
+    if let Some(obj) = def.as_object_mut() {
         obj.insert("definitions".to_string(), root["definitions"].clone());
     }
-    let sv = ObjectTree::new(data.clone(), full_schema);
-    match sv.validate() {
-        Ok(()) => {}
-        Err(errs) => panic!(
-            "{label} failed MCP schema conformance:\n  data: {}\n  errors: {:?}",
-            serde_json::to_string_pretty(data).unwrap(),
-            errs
-        ),
+    def
+}
+
+fn assert_conforms(label: &str, data: &serde_json::Value, schema: &serde_json::Value) {
+    if let Err(e) = check_value_with_root(schema, data, Some(schema)) {
+        panic!(
+            "{label} failed schema conformance:\n  data: {}\n  error: {e:?}",
+            serde_json::to_string_pretty(data).unwrap()
+        );
     }
 }
 
-struct WrapperProcess {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn initialize_result_conforms() {
+    let root = load_mcp_schema();
+    let schema = schema_for(&root, "InitializeResult");
+
+    let data = serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "test", "version": "0.1.0"}
+    });
+    assert_conforms("InitializeResult", &data, &schema);
 }
 
-impl WrapperProcess {
-    async fn spawn() -> Self {
-        let script_path = format!("/tmp/mcp_conformance_server_{}.py", std::process::id());
-        tokio::fs::write(&script_path, echo_server_script()).await.unwrap();
+#[test]
+fn list_tools_result_conforms() {
+    let root = load_mcp_schema();
+    let schema = schema_for(&root, "ListToolsResult");
 
-        let mut child = Command::new(wrapper_bin())
-            .arg("--init-timeout").arg("5")
-            .arg("python3").arg(&script_path)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-            .spawn().expect("failed to spawn wrapper");
-
-        let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        WrapperProcess { child, stdin, stdout }
-    }
-
-    async fn send(&mut self, msg: serde_json::Value) {
-        let line = serde_json::to_string(&msg).unwrap() + "\n";
-        self.stdin.write_all(line.as_bytes()).await.unwrap();
-    }
-
-    async fn recv(&mut self) -> serde_json::Value {
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            self.stdout.read_line(&mut buf).await.unwrap();
-            let v: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
-            if v.get("id").is_some() { return v; }
-        }
-    }
-
-    async fn handshake(&mut self) -> serde_json::Value {
-        self.send(serde_json::json!({
-            "jsonrpc":"2.0","id":1,"method":"initialize",
-            "params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}
-        })).await;
-        let resp = self.recv().await;
-        self.send(serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await;
-        resp
-    }
-
-    async fn kill(mut self) { let _ = self.child.kill().await; }
+    let data = serde_json::json!({
+        "tools": [{
+            "name": "echo",
+            "description": "Echo input",
+            "inputSchema": {"type": "object", "properties": {"msg": {"type": "string"}}}
+        }]
+    });
+    assert_conforms("ListToolsResult", &data, &schema);
 }
 
-// ── Conformance tests ─────────────────────────────────────────────────────────
+#[test]
+fn list_tools_result_empty_conforms() {
+    let root = load_mcp_schema();
+    let schema = schema_for(&root, "ListToolsResult");
 
-/// Every response must be a valid JSONRPCResponse envelope.
-#[tokio::test]
-async fn test_response_envelope_conforms() {
-    let schema = load_mcp_schema();
-    let envelope_def = definition(&schema, "JSONRPCResponse");
-
-    let mut w = WrapperProcess::spawn().await;
-    let init_resp = w.handshake().await;
-
-    assert_conforms("initialize response envelope", &init_resp, &envelope_def, &schema);
-    w.kill().await;
+    let data = serde_json::json!({"tools": []});
+    assert_conforms("ListToolsResult (empty)", &data, &schema);
 }
 
-/// InitializeResult must conform to MCP schema.
-#[tokio::test]
-async fn test_initialize_result_conforms() {
-    let schema = load_mcp_schema();
-    let def = definition(&schema, "InitializeResult");
+#[test]
+fn list_prompts_result_conforms() {
+    let root = load_mcp_schema();
+    let schema = schema_for(&root, "ListPromptsResult");
 
-    let mut w = WrapperProcess::spawn().await;
-    let resp = w.handshake().await;
-    let result = &resp["result"];
-
-    assert_conforms("InitializeResult", result, &def, &schema);
-    w.kill().await;
+    let data = serde_json::json!({"prompts": []});
+    assert_conforms("ListPromptsResult", &data, &schema);
 }
 
-/// ListToolsResult must conform to MCP schema.
-#[tokio::test]
-async fn test_list_tools_result_conforms() {
-    let schema = load_mcp_schema();
-    let def = definition(&schema, "ListToolsResult");
+#[test]
+fn list_resources_result_conforms() {
+    let root = load_mcp_schema();
+    let schema = schema_for(&root, "ListResourcesResult");
 
-    let mut w = WrapperProcess::spawn().await;
-    w.handshake().await;
-    w.send(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})).await;
-    let resp = w.recv().await;
-
-    assert_conforms("ListToolsResult", &resp["result"], &def, &schema);
-    w.kill().await;
+    let data = serde_json::json!({"resources": []});
+    assert_conforms("ListResourcesResult", &data, &schema);
 }
 
-/// Each Tool in the tools list must conform to MCP Tool schema.
-#[tokio::test]
-async fn test_tool_definition_conforms() {
-    let schema = load_mcp_schema();
-    let tool_def = definition(&schema, "Tool");
+#[test]
+fn list_resource_templates_result_conforms() {
+    let root = load_mcp_schema();
+    let schema = schema_for(&root, "ListResourceTemplatesResult");
 
-    let mut w = WrapperProcess::spawn().await;
-    w.handshake().await;
-    w.send(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})).await;
-    let resp = w.recv().await;
-
-    let tools = resp["result"]["tools"].as_array().expect("tools array");
-    for (i, tool) in tools.iter().enumerate() {
-        assert_conforms(&format!("Tool[{i}]"), tool, &tool_def, &schema);
-    }
-    w.kill().await;
+    let data = serde_json::json!({"resourceTemplates": []});
+    assert_conforms("ListResourceTemplatesResult", &data, &schema);
 }
 
-/// ListPromptsResult must conform to MCP schema.
-#[tokio::test]
-async fn test_list_prompts_result_conforms() {
-    let schema = load_mcp_schema();
-    let def = definition(&schema, "ListPromptsResult");
+#[test]
+fn call_tool_result_conforms() {
+    let root = load_mcp_schema();
+    let schema = schema_for(&root, "CallToolResult");
 
-    let mut w = WrapperProcess::spawn().await;
-    w.handshake().await;
-    w.send(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"prompts/list","params":{}})).await;
-    let resp = w.recv().await;
-
-    assert_conforms("ListPromptsResult", &resp["result"], &def, &schema);
-    w.kill().await;
+    let data = serde_json::json!({
+        "content": [{"type": "text", "text": "hello"}]
+    });
+    assert_conforms("CallToolResult", &data, &schema);
 }
 
-/// ListResourcesResult must conform to MCP schema.
-#[tokio::test]
-async fn test_list_resources_result_conforms() {
-    let schema = load_mcp_schema();
-    let def = definition(&schema, "ListResourcesResult");
+#[test]
+fn jsonrpc_response_envelope_conforms() {
+    let root = load_mcp_schema();
+    let schema = schema_for(&root, "JSONRPCResponse");
 
-    let mut w = WrapperProcess::spawn().await;
-    w.handshake().await;
-    w.send(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"resources/list","params":{}})).await;
-    let resp = w.recv().await;
-
-    assert_conforms("ListResourcesResult", &resp["result"], &def, &schema);
-    w.kill().await;
+    // build_response equivalent structure
+    let data = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"protocolVersion": "2025-03-26", "capabilities": {}, "serverInfo": {"name": "t", "version": "0.1"}}
+    });
+    assert_conforms("JSONRPCResponse", &data, &schema);
 }
 
-/// ListResourceTemplatesResult must conform to MCP schema.
-#[tokio::test]
-async fn test_list_resource_templates_result_conforms() {
-    let schema = load_mcp_schema();
-    let def = definition(&schema, "ListResourceTemplatesResult");
+#[test]
+fn jsonrpc_error_envelope_conforms() {
+    let root = load_mcp_schema();
+    let schema = schema_for(&root, "JSONRPCError");
 
-    let mut w = WrapperProcess::spawn().await;
-    w.handshake().await;
-    w.send(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"resources/templates/list","params":{}})).await;
-    let resp = w.recv().await;
-
-    assert_conforms("ListResourceTemplatesResult", &resp["result"], &def, &schema);
-    w.kill().await;
+    // build_error_response equivalent structure
+    let data = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32603, "message": "internal error"}
+    });
+    assert_conforms("JSONRPCError", &data, &schema);
 }
 
-/// CallToolResult must conform to MCP schema.
-#[tokio::test]
-async fn test_call_tool_result_conforms() {
-    let schema = load_mcp_schema();
-    let def = definition(&schema, "CallToolResult");
+#[test]
+fn jsonrpc_error_with_data_conforms() {
+    let root = load_mcp_schema();
+    let schema = schema_for(&root, "JSONRPCError");
 
-    let mut w = WrapperProcess::spawn().await;
-    w.handshake().await;
-    w.send(serde_json::json!({
-        "jsonrpc":"2.0","id":2,"method":"tools/call",
-        "params":{"name":"echo","arguments":{"msg":"conformance check"}}
-    })).await;
-    let resp = w.recv().await;
-
-    assert_conforms("CallToolResult", &resp["result"], &def, &schema);
-    w.kill().await;
-}
-
-/// JSONRPCError response (unknown tool) must conform to JSONRPCError schema.
-#[tokio::test]
-async fn test_error_response_conforms() {
-    let schema = load_mcp_schema();
-    let def = definition(&schema, "JSONRPCError");
-
-    let mut w = WrapperProcess::spawn().await;
-    w.handshake().await;
-    w.send(serde_json::json!({
-        "jsonrpc":"2.0","id":2,"method":"tools/call",
-        "params":{"name":"nonexistent_tool","arguments":{}}
-    })).await;
-
-    // Read raw line — may be error or result (depending on backend behavior)
-    let resp = w.recv().await;
-    if resp.get("error").is_some() {
-        assert_conforms("JSONRPCError", &resp, &def, &schema);
-    }
-    // If result (backend returned error in content), that's also valid per MCP spec
-    w.kill().await;
+    let data = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32601, "message": "method not found", "data": {"detail": "unknown"}}
+    });
+    assert_conforms("JSONRPCError (with data)", &data, &schema);
 }

@@ -2,11 +2,11 @@
 
 ## Design Philosophy
 
-**Unix Philosophy**: Do one thing well - transparent protocol proxying with intelligent caching.
+**Unix Philosophy**: Do one thing well — transparent protocol proxying with intelligent caching.
 
 The wrapper follows a simple principle: **cache what's static, proxy what's dynamic**.
 
-Built on [rmcp](https://crates.io/crates/rmcp) 0.16 (official Rust MCP SDK), which handles all JSON-RPC protocol details.
+Handles raw JSON-RPC 2.0 directly — no SDK dependency for protocol handling.
 
 ## System Overview
 
@@ -14,166 +14,117 @@ Built on [rmcp](https://crates.io/crates/rmcp) 0.16 (official Rust MCP SDK), whi
 ┌──────────────────────────────────────────────────────────────────┐
 │                        mcp-wrapper-rs                            │
 │                                                                  │
-│  ┌─────────────┐    ┌──────────────────────────────────────┐    │
-│  │   Stdin     │───▶│   McpProxy (ServerHandler trait)     │    │
-│  │  (JSON-RPC) │    │                                      │    │
-│  └─────────────┘    │   initialize → cached ServerInfo     │    │
-│                     │   tools/list → cached ListToolsResult │    │
-│                     │   prompts/list → cached               │    │
-│                     │   resources/list → cached              │    │
-│                     │   resources/templates/list → cached    │    │
-│                     │                                      │    │
-│                     │   tools/call → ensure_backend() ─────│──▶ MCP Server
-│                     │              → peer.call_tool()      │    (persistent)
-│                     └──────────────────────────────────────┘    │
-│                                                                  │
-│  ┌─────────────┐                                                 │
-│  │   Stdout    │◀── rmcp handles response routing ──────────────│
-│  │  (JSON-RPC) │                                                 │
-│  └─────────────┘                                                 │
+│  ┌─────────┐   ┌────────┐   ┌───────────────────────────┐      │
+│  │  Stdin  │──▶│ Router │──▶│ Cached     → Cache        │      │
+│  │(JSON-RPC)│   │        │   │ PassThru   → Backend  ────│──▶ MCP Server
+│  └─────────┘   └────────┘   │ Notify     → relay        │   (on-demand)
+│                              └───────────────────────────┘      │
+│  ┌─────────┐                                                     │
+│  │ Stdout  │◀── transport.rs writes JSON-RPC responses ─────────│
+│  │(JSON-RPC)│                                                     │
+│  └─────────┘                                                     │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+## Modules
+
+| module | responsibility |
+|--------|---------------|
+| `transport.rs` | Line-delimited JSON-RPC read/write, message builders (response, error, notification) |
+| `router.rs` | Classify methods as Cached, PassThrough, or Notification; extract params |
+| `cache.rs` | Spawn init subprocess, query all list endpoints, store results, handle invalidation |
+| `proxy.rs` | Backend lifecycle: lazy spawn, health check, request/response matching via oneshot channels |
+| `main.rs` | CLI parsing, signal handling, event loop wiring router + cache + proxy |
+
 ## Request Flow
 
-### Static Requests (Cached)
+### Cached Requests
 
 ```
-Client                  Wrapper (McpProxy)
+Client                  Wrapper
   │                        │
-  │─── initialize ────────▶│ → returns cached ServerInfo (instant)
+  │─── initialize ────────▶│ → returns merged capabilities (instant)
   │◀── response ───────────│
   │                        │
-  │─── tools/list ────────▶│ → returns cached ListToolsResult (instant)
+  │─── tools/list ────────▶│ → returns cached tools (instant)
   │◀── response ───────────│
 ```
 
-**Latency**: < 1ms (rmcp handles serialization and id mapping)
+**Latency**: < 1ms (served from in-memory cache)
 
-### Dynamic Requests (Persistent Backend)
+### Pass-Through Requests
 
 ```
 Client                  Wrapper                  Backend (persistent)
   │                        │                        │
   │─── tools/call ────────▶│                        │
   │                        │── ensure_backend() ──▶│ (spawns if needed)
-  │                        │   rmcp client init    │
-  │                        │── peer.call_tool() ──▶│
-  │                        │◀── CallToolResult ────│
+  │                        │── forward request ───▶│ (ID remapped)
+  │                        │◀── response ──────────│ (ID restored)
   │◀── response ───────────│                        │ (stays alive)
   │                        │                        │
-  │─── tools/call ────────▶│── peer.call_tool() ──▶│ (reuses connection)
-  │                        │◀── CallToolResult ────│
+  │─── tools/call ────────▶│── forward request ───▶│ (reuses backend)
+  │                        │◀── response ──────────│
   │◀── response ───────────│                        │
 ```
 
-**Latency**: Same as direct subprocess call (no re-init overhead after first call)
+### Notification Relay
 
-## Data Structures
+Bidirectional: backend notifications forwarded to client, client notifications forwarded to backend.
 
-### McpProxy
-
-```rust
-struct McpProxy {
-    cmd: String,
-    cmd_args: Vec<String>,
-    // Cached from init phase
-    cached_tools: ListToolsResult,
-    cached_prompts: ListPromptsResult,
-    cached_resources: ListResourcesResult,
-    cached_resource_templates: ListResourceTemplatesResult,
-    server_info: ServerInfo,
-    // Persistent backend connection (lazy-spawned on first tool call)
-    backend: tokio::sync::Mutex<Option<RunningService<RoleClient, ()>>>,
-}
-```
-
-### ServerHandler Trait
-
-McpProxy implements `rmcp::ServerHandler`, overriding only:
-- `get_info()` → cached ServerInfo
-- `list_tools()` → cached ListToolsResult
-- `list_prompts()` → cached ListPromptsResult
-- `list_resources()` → cached ListResourcesResult
-- `list_resource_templates()` → cached ListResourceTemplatesResult
-- `call_tool()` → forwarded via persistent backend
-
-All other methods (ping, initialize, etc.) use rmcp's default implementations.
+Cache invalidation notifications (`tools/list_changed`, `prompts/list_changed`, `resources/list_changed`) trigger automatic cache refresh.
 
 ## Initialization Sequence
 
 ```
 Wrapper                              Subprocess (init, temporary)
    │                                     │
-   │─── rmcp serve_client() ────────────▶│ (rmcp handles handshake)
-   │◀── RunningService<RoleClient> ──────│
+   │─── spawn process ─────────────────▶│
+   │─── initialize request ────────────▶│ (raw JSON-RPC handshake)
+   │◀── initialize response ───────────│
+   │─── initialized notification ─────▶│
    │                                     │
-   │─── peer.list_all_tools() ─────────▶│ (pagination; init_timeout applies)
-   │◀── Vec<Tool> ──────────────────────│
-   │─── peer.list_all_prompts() ───────▶│ (skipped if timeout expires)
-   │◀── Vec<Prompt> ────────────────────│
-   │─── peer.list_all_resources() ─────▶│ (skipped if timeout expires)
-   │◀── Vec<Resource> ──────────────────│
-   │─── peer.list_all_resource_templates() ─▶│ (skipped if timeout expires)
-   │◀── Vec<ResourceTemplate> ──────────│
+   │─── tools/list ───────────────────▶│ (init_timeout applies)
+   │◀── tools response ───────────────│
+   │─── prompts/list ─────────────────▶│
+   │◀── prompts response ─────────────│
+   │─── resources/list ───────────────▶│
+   │◀── resources response ────────────│
+   │─── resources/templates/list ─────▶│
+   │◀── templates response ────────────│
    │                                     │
-   │─── drop(client) → graceful_shutdown ▶✗
+   │─── kill process ──────────────────▶✗
    │
    ▼ (cache populated, ready to serve on stdio)
 ```
 
-## Backend Connection Management
+## Backend Lifecycle
 
-```rust
-async fn ensure_backend(&self) -> Result<Peer<RoleClient>, ErrorData> {
-    let mut guard = self.backend.lock().await;
-    if let Some(ref running) = *guard {
-        if !running.is_closed() {
-            return Ok(running.peer().clone()); // Reuse existing
-        }
-        // Dead connection, will re-spawn below
-    }
-    // Spawn new subprocess via rmcp client
-    let transport = TokioChildProcess::builder(command).stderr(piped).spawn()?; // captured for error msgs
-    let running = ().serve(transport).await?; // rmcp handles handshake
-    let peer = running.peer().clone();
-    *guard = Some(running);
-    Ok(peer)
-}
-```
-
-Key decisions:
-- `tokio::sync::Mutex` because lock guard spans `.await` points
-- `is_closed()` detects dead subprocess → automatic re-spawn
-- `Peer` cloned before releasing lock (cheap Arc-based clone)
-
-## Subprocess Management
-
-rmcp's `TokioChildProcess` handles:
-- Process group management via `process-wrap` crate
-- Kill-on-drop (no zombie processes)
-- Graceful shutdown (close stdin → wait → kill on timeout)
-- stderr captured via `Stdio::piped()` and kept in a ring buffer (last 4KB); attached to error responses on backend failure
+- **Lazy spawn**: Backend created on first pass-through request
+- **Retry**: 3 attempts with exponential backoff (100ms, 200ms, 400ms)
+- **Full handshake**: Each spawn performs MCP initialize + initialized sequence
+- **Health check**: Verify child process alive before forwarding
+- **Graceful shutdown**: SIGTERM → 5s wait → SIGKILL
+- **Process groups**: Each child in own process group via `process-wrap`; `child_pgids` registry for cleanup
 
 ## Error Handling
 
 | Scenario | Behavior |
 |----------|----------|
 | Init subprocess fails | Exit with error message |
-| Backend spawn fails | Return ErrorData to client |
-| Backend dies mid-session | Auto re-spawn on next call |
-| Tool call fails | ErrorData propagated to client |
-| rmcp protocol error | Handled by rmcp SDK |
+| Backend spawn fails (after retries) | JSON-RPC error response to client |
+| Backend dies mid-session | Auto re-spawn on next request |
+| Pass-through call fails | JSON-RPC error propagated to client |
+| Malformed JSON from backend | Logged and skipped |
 
 ## Limitations
 
 1. **No streaming**: Responses collected before returning
-2. **No subscriptions**: `listChanged` notifications not supported
-3. **Cache invalidation**: Tools list cached at startup only
-4. **Single backend**: One persistent subprocess for all tool calls
+2. **Single backend**: One persistent subprocess for all calls
 
 ## Future Improvements
 
-- [ ] Cache refresh on demand
-- [ ] `tools/listChanged` notification support
-- [x] Configurable init timeout (`--init-timeout`, default 5s)
+- [ ] Connection pooling for high-throughput scenarios
+- [x] Configurable init timeout (`--init-timeout`, default 30s)
+- [x] Cache invalidation via `listChanged` notifications
+- [x] Bidirectional notification relay
