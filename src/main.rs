@@ -15,6 +15,7 @@ use rmcp::{
     service::{RequestContext, RoleClient, RoleServer, RunningService, ServiceError},
     transport::{TokioChildProcess, io::stdio},
 };
+use process_wrap::tokio::{CommandWrap, ProcessGroup};
 use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::future::Future;
@@ -178,6 +179,10 @@ enum BackendState {
 
 type Backend = tokio::sync::Mutex<BackendState>;
 
+/// Track all spawned child pgids for cleanup on exit.
+/// ProcessGroup::leader() ensures pgid == child pid.
+type ChildPgids = Arc<std::sync::Mutex<Vec<u32>>>;
+
 struct McpProxy {
     cmd: String,
     cmd_args: Vec<String>,
@@ -191,6 +196,7 @@ struct McpProxy {
     backend: Arc<Backend>,
     last_activity: Arc<AtomicU64>,
     active_calls: Arc<AtomicUsize>,
+    child_pgids: ChildPgids,
 }
 
 struct ActiveCallGuard {
@@ -211,12 +217,17 @@ impl Drop for ActiveCallGuard {
 }
 
 impl McpProxy {
-    fn spawn_child(cmd: &str, cmd_args: &[String]) -> std::io::Result<(TokioChildProcess, Arc<Mutex<String>>)> {
+    fn spawn_child(cmd: &str, cmd_args: &[String], child_pgids: &ChildPgids) -> std::io::Result<(TokioChildProcess, Arc<Mutex<String>>)> {
         let mut command = Command::new(cmd);
         command.args(cmd_args);
-        let (proc, stderr_opt) = TokioChildProcess::builder(command)
+        let mut wrapped = CommandWrap::from(command);
+        wrapped.wrap(ProcessGroup::leader());
+        let (proc, stderr_opt) = TokioChildProcess::builder(wrapped)
             .stderr(Stdio::piped())
             .spawn()?;
+        if let Some(pid) = proc.id() {
+            child_pgids.lock().unwrap().push(pid);
+        }
         let stderr_buf = match stderr_opt {
             Some(stderr) => spawn_stderr_reader(stderr),
             None => Arc::new(Mutex::new(String::new())),
@@ -225,9 +236,10 @@ impl McpProxy {
     }
 
     async fn new(cmd: String, cmd_args: Vec<String>, init_timeout: Duration) -> Result<Self, Box<dyn std::error::Error>> {
+        let child_pgids: ChildPgids = Arc::new(std::sync::Mutex::new(Vec::new()));
         debug!("init: spawning subprocess");
-        let (transport, stderr_buf) = Self::spawn_child(&cmd, &cmd_args)?;
-        Self::init_from_transport(cmd, cmd_args, transport, stderr_buf, init_timeout).await
+        let (transport, stderr_buf) = Self::spawn_child(&cmd, &cmd_args, &child_pgids)?;
+        Self::init_from_transport(cmd, cmd_args, transport, stderr_buf, init_timeout, child_pgids).await
     }
 
     /// Build a proxy by querying an already-created transport.
@@ -238,6 +250,7 @@ impl McpProxy {
         transport: T,
         stderr_buf: Arc<Mutex<String>>,
         init_timeout: Duration,
+        child_pgids: ChildPgids,
     ) -> Result<Self, Box<dyn std::error::Error>>
     where
         T: rmcp::transport::Transport<RoleClient> + Send + 'static,
@@ -335,6 +348,7 @@ impl McpProxy {
             backend: Arc::new(tokio::sync::Mutex::new(BackendState::Ready(client, stderr_buf))),
             last_activity: Arc::new(AtomicU64::new(now_millis())),
             active_calls: Arc::new(AtomicUsize::new(0)),
+            child_pgids,
         })
     }
 
@@ -379,7 +393,7 @@ impl McpProxy {
                 }
                 Next::Spawn(notify) => {
                     info!("backend: spawning");
-                    let (transport, stderr_buf) = match Self::spawn_child(&self.cmd, &self.cmd_args) {
+                    let (transport, stderr_buf) = match Self::spawn_child(&self.cmd, &self.cmd_args, &self.child_pgids) {
                         Ok(v) => v,
                         Err(e) => {
                             warn!(err = %e, "backend: spawn failed");
@@ -791,6 +805,7 @@ async fn async_main(args: Vec<String>) {
 
     // Grab Arc handles before proxy is moved into serve()
     let backend_handle = proxy.backend.clone();
+    let child_pgids_handle = proxy.child_pgids.clone();
     let last_activity_handle = proxy.last_activity.clone();
     let active_calls_handle = proxy.active_calls.clone();
 
@@ -826,6 +841,14 @@ async fn async_main(args: Vec<String>) {
     match server.waiting().await {
         Ok(_) => {}
         Err(e) => warn!(err = %e, "server waiting error"),
+    }
+
+    // Kill all child process groups before runtime shuts down.
+    // rmcp's ChildWithCleanup::drop uses tokio::spawn which fails during shutdown.
+    let pgids = child_pgids_handle.lock().unwrap().clone();
+    for pgid in &pgids {
+        info!(pgid = pgid, "killing child process group");
+        unsafe { libc::kill(-(*pgid as libc::pid_t), libc::SIGKILL); }
     }
     info!("shutdown");
 }
