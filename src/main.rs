@@ -9,7 +9,9 @@
 //! - tools/call and other pass-through requests spawn a persistent backend on demand
 //! - Raw JSON-RPC over stdin/stdout — no SDK dependency for protocol handling
 
+mod broker;
 mod cache;
+mod daemon;
 mod proxy;
 mod router;
 mod transport;
@@ -34,7 +36,7 @@ use crate::router::Route;
 // ── Logging helpers ─────────────────────────────────────────────────
 
 /// Resolve log directory: $XDG_RUNTIME_DIR/mcp-wrapper > $TMPDIR > /tmp
-fn log_dir() -> String {
+pub fn log_dir() -> String {
     if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
         let dir = format!("{}/mcp-wrapper", xdg);
         if std::fs::create_dir_all(&dir).is_ok() {
@@ -48,7 +50,7 @@ fn log_dir() -> String {
 }
 
 /// Compute 8-char hex hash from cmd + args for unique log file naming.
-fn cmd_hash(cmd: &str, args: &[String]) -> String {
+pub fn cmd_hash(cmd: &str, args: &[String]) -> String {
     let mut h = DefaultHasher::new();
     cmd.hash(&mut h);
     args.hash(&mut h);
@@ -57,7 +59,7 @@ fn cmd_hash(cmd: &str, args: &[String]) -> String {
 
 /// Initialize tracing to file if MCP_WRAPPER_DEBUG is set.
 /// Returns WorkerGuard that must be kept alive for the duration of the program.
-fn init_tracing(cmd: &str, args: &[String]) -> Option<WorkerGuard> {
+pub fn init_tracing(cmd: &str, args: &[String]) -> Option<WorkerGuard> {
     let level_str = env::var("MCP_WRAPPER_DEBUG").ok()?;
 
     let level = match level_str.to_lowercase().as_str() {
@@ -88,7 +90,7 @@ fn init_tracing(cmd: &str, args: &[String]) -> Option<WorkerGuard> {
     Some(guard)
 }
 
-fn infer_mcp_name(cmd: &str, args: &[String]) -> String {
+pub fn infer_mcp_name(cmd: &str, args: &[String]) -> String {
     if let Ok(name) = env::var("MCP_SERVER_NAME") {
         return sanitize_name(&name);
     }
@@ -116,7 +118,7 @@ fn infer_mcp_name(cmd: &str, args: &[String]) -> String {
     sanitize_name(cmd)
 }
 
-fn sanitize_name(name: &str) -> String {
+pub fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect()
@@ -155,17 +157,19 @@ impl Drop for ActiveCallGuard {
 fn print_usage(program: &str) {
     eprintln!("mcp-wrapper-rs - Universal lightweight MCP proxy");
     eprintln!();
-    eprintln!("Usage: {} [--init-timeout <secs>] <command> [args...]", program);
+    eprintln!("Usage: {} [options] <command> [args...]", program);
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --version, -V              Show version and exit");
     eprintln!("  --help, -h                 Show this help and exit");
     eprintln!("  --init-timeout <secs>      Seconds to wait for subprocess init handshake (default: 30)");
+    eprintln!("  --daemon                   Share a single backend via a broker process (N:1 architecture)");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {} python3 server.py", program);
     eprintln!("  {} npx -y @anthropics/mcp-searxng", program);
     eprintln!("  {} --init-timeout 10 codex mcp-server", program);
+    eprintln!("  {} --daemon python3 server.py", program);
     eprintln!();
     eprintln!("Environment Variables:");
     eprintln!("  MCP_WRAPPER_DEBUG=N    Enable logging: 1/info, 2/warn, 3/debug (to $XDG_RUNTIME_DIR/mcp-wrapper/ or /tmp)");
@@ -175,7 +179,14 @@ fn print_usage(program: &str) {
 fn main() {
     let args: Vec<String> = env::args().collect();
 
+    // --broker-internal: run broker BEFORE tokio runtime (clean fork)
+    if args.len() >= 2 && args[1] == "--broker-internal" {
+        broker::start_broker_process(args[2..].to_vec());
+        return;
+    }
+
     // Handle flags before starting runtime
+    let mut daemon_mode = false;
     if args.len() >= 2 && args[1].starts_with('-') {
         match args[1].as_str() {
             "--version" | "-V" => {
@@ -193,6 +204,9 @@ fn main() {
                     print_usage(&args[0]);
                     std::process::exit(1);
                 }
+            }
+            "--daemon" => {
+                daemon_mode = true;
             }
             unknown_flag => {
                 eprintln!("Error: Unknown option: {}", unknown_flag);
@@ -215,15 +229,18 @@ fn main() {
         .build()
         .expect("failed to create tokio runtime");
 
-    rt.block_on(async_main(args));
+    rt.block_on(async_main(args, daemon_mode));
 }
 
 // ── Async main loop ─────────────────────────────────────────────────
 
-async fn async_main(args: Vec<String>) {
+async fn async_main(args: Vec<String>, daemon_mode: bool) {
+    // Skip --daemon in arg parsing (already consumed by main())
+    let base = if daemon_mode { 2 } else { 1 };
+
     // Parse --init-timeout <secs>
-    let (init_timeout, cmd_start) = if args.len() >= 2 && args[1] == "--init-timeout" {
-        let secs: u64 = match args.get(2).and_then(|s| s.parse().ok()) {
+    let (init_timeout, cmd_start) = if args.get(base).map(|s| s.as_str()) == Some("--init-timeout") {
+        let secs: u64 = match args.get(base + 1).and_then(|s| s.parse().ok()) {
             Some(n) => n,
             None => {
                 eprintln!("Error: --init-timeout requires a positive integer");
@@ -234,9 +251,9 @@ async fn async_main(args: Vec<String>) {
             eprintln!("Error: --init-timeout must be greater than 0");
             std::process::exit(1);
         }
-        (Duration::from_secs(secs), 3)
+        (Duration::from_secs(secs), base + 2)
     } else {
-        (Duration::from_secs(30), 1)
+        (Duration::from_secs(30), base)
     };
 
     if args.len() <= cmd_start {
@@ -257,6 +274,23 @@ async fn async_main(args: Vec<String>) {
         "started"
     );
     debug!(args = ?cmd_args, "startup args");
+
+    // Daemon mode: connect to shared broker, relay stdin/stdout
+    if daemon_mode {
+        let paths = daemon::daemon_paths(&cmd, &cmd_args);
+        match daemon::connect_or_start_broker(&paths, &cmd, &cmd_args, init_timeout).await {
+            Ok(stream) => {
+                if let Err(e) = daemon::run_relay(stream).await {
+                    warn!(err = %e, "relay error");
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     // Register signal handlers before init (interruptible init)
     #[cfg(unix)]
@@ -682,7 +716,7 @@ async fn spawn_and_init_backend(
 /// Uses SIGKILL intentionally: this is last-resort cleanup on wrapper exit.
 /// Individual backends are already killed gracefully via `Backend::kill()`
 /// (SIGTERM → wait → SIGKILL) during idle reaper or normal shutdown.
-fn kill_all_pgids(child_pgids: &ChildPgids) {
+pub fn kill_all_pgids(child_pgids: &ChildPgids) {
     let pgids = child_pgids.lock().unwrap().clone();
     for pgid in &pgids {
         info!(pgid = pgid, "killing child process group");

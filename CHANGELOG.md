@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.4.0] - 2026-03-17
+
+### Added
+
+- **Daemon mode** (`--daemon`): N:1 broker architecture where multiple wrapper instances share a single backend subprocess via Unix domain socket
+- `src/daemon.rs`: coordination protocol (flock + PID file + UDS connect/retry), bidirectional stdin↔UDS relay
+- `src/broker.rs`: multi-session broker with shared cache, backend multiplexing, notification fanout
+- PID file management (`{hash}.pid`) for stale broker detection and recovery
+- Orphan guard: broker auto-exits after 120s if no session ever connects
+- Idle exit: broker shuts down 60s after all sessions disconnect
+- Signal handling (SIGINT/SIGTERM) for graceful broker and relay shutdown
+- Integration tests for daemon mode: single client, two-client sharing, ping
+
+### Changed
+
+- Version bump to 0.4.0
+- Made helper functions `pub` for broker reuse: `init_tracing`, `kill_all_pgids`, `cmd_hash`, `log_dir`, `sanitize_name`, `infer_mcp_name`
+- Updated CLI help to document `--daemon` flag
+
+### Dependencies
+
+- Added `fd-lock = "4"` for flock-based coordination
+- Added `"net"` to tokio features for Unix domain socket support
+
 ## [0.3.0] - 2026-03-05
 
 ### Changed

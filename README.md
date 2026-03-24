@@ -55,8 +55,17 @@ Check [Releases](https://github.com/woolkingx/mcp-wrapper-rs/releases) for pre-b
 ## Usage
 
 ```bash
-mcp-wrapper-rs [--init-timeout <secs>] <command> [args...]
+mcp-wrapper-rs [options] <command> [args...]
 ```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `--init-timeout <secs>` | Seconds to wait for subprocess init handshake (default: 30) |
+| `--daemon` | Share a single backend via a broker process (N:1 architecture) |
+| `--version`, `-V` | Show version and exit |
+| `--help`, `-h` | Show help and exit |
 
 ### Examples
 
@@ -70,9 +79,34 @@ mcp-wrapper-rs python3 /path/to/server.py
 # Wrap with environment variables (inherited from parent)
 SEARXNG_URL=http://localhost:8080 mcp-wrapper-rs npx -y mcp-searxng
 
-# Use custom init timeout (default: 5s; increase for slow-starting servers)
+# Use custom init timeout (default: 30s; increase for slow-starting servers)
 mcp-wrapper-rs --init-timeout 15 npx -y mcp-searxng
+
+# Daemon mode: multiple clients share one backend
+mcp-wrapper-rs --daemon python3 /path/to/server.py
 ```
+
+### Daemon Mode
+
+With `--daemon`, multiple wrapper instances share a single backend subprocess through an auto-managed broker process:
+
+```
+wrapper 1 (stdio) ──→ UDS ──→ broker ──→ backend (single subprocess)
+wrapper 2 (stdio) ──→ UDS ──→ broker ──↗
+wrapper 3 (stdio) ──→ UDS ──→ broker ──↗
+```
+
+The first wrapper auto-spawns the broker; subsequent wrappers connect to it. The broker manages:
+- Shared cache (initialize, tools/list, etc.)
+- Backend subprocess lifecycle (lazy spawn, respawn on failure)
+- Request multiplexing with ID remapping
+- Notification fanout to all connected clients
+- Graceful shutdown: idle exit after 60s with no sessions
+
+Coordination uses flock + PID file + Unix domain socket under `$XDG_RUNTIME_DIR/mcp-wrapper/`.
+
+**When to use**: Stateless MCP servers shared across multiple Claude Code sessions.
+**When NOT to use**: Stateful servers (e.g., browser automation) where each session needs its own backend.
 
 ### Claude Code Configuration
 
@@ -97,7 +131,7 @@ Edit `~/.claude.json`:
     "my-python-server": {
       "type": "stdio",
       "command": "/path/to/mcp-wrapper-rs",
-      "args": ["python3", "/path/to/server.py"]
+      "args": ["--daemon", "python3", "/path/to/server.py"]
     }
   }
 }
