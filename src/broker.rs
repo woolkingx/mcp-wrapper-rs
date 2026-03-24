@@ -69,17 +69,19 @@ async fn broker_main(cmd: String, cmd_args: Vec<String>, init_timeout: Duration)
     let paths = daemon::daemon_paths(&cmd, &cmd_args);
     let child_pgids: ChildPgids = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    // Build cache
-    let cache = match cache::init_cache(&cmd, &cmd_args, init_timeout, &child_pgids).await {
-        Ok(c) => Arc::new(c),
+    // Build cache and keep the init backend alive for reuse
+    let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<Value>();
+    let (cache, init_backend) = match cache::init_cache_with_backend(
+        &cmd, &cmd_args, init_timeout, &child_pgids, notif_tx.clone(),
+    ).await {
+        Ok(pair) => (Arc::new(pair.0), pair.1),
         Err(e) => {
             warn!(err = %e, "broker: init_cache failed");
             std::process::exit(1);
         }
     };
-
-    let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<Value>();
-    let backend: Arc<Mutex<Option<Backend>>> = Arc::new(Mutex::new(None));
+    let backend: Arc<Mutex<Option<Backend>>> = Arc::new(Mutex::new(Some(init_backend)));
+    info!("broker: init backend kept alive for reuse");
 
     let state = Arc::new(BrokerState {
         cmd: cmd.clone(),
@@ -384,8 +386,15 @@ async fn handle_request(
     }
 }
 
-/// Ensure a live backend exists. Same retry logic as main.rs ensure_backend.
+/// Ensure a live backend exists. On respawn, refreshes cache synchronously
+/// before notifying clients, so clients never read stale cache.
+///
+/// Sequence on respawn:
+/// 1. Spawn new backend + MCP handshake
+/// 2. Query all list/* endpoints → update cache
+/// 3. Send list_changed notifications to connected clients
 async fn ensure_backend(state: &Arc<BrokerState>) -> Result<(), String> {
+    let was_respawn;
     {
         let guard = state.backend.lock().await;
         if let Some(be) = guard.as_ref() {
@@ -393,6 +402,9 @@ async fn ensure_backend(state: &Arc<BrokerState>) -> Result<(), String> {
                 return Ok(());
             }
             warn!("broker: backend died, will respawn");
+            was_respawn = true;
+        } else {
+            was_respawn = false;
         }
     }
 
@@ -407,17 +419,16 @@ async fn ensure_backend(state: &Arc<BrokerState>) -> Result<(), String> {
                     old.kill().await;
                 }
                 *guard = Some(new_be);
-                drop(guard);
 
-                // Trigger cache refresh via existing fanout mechanism
-                for method in &[
-                    "notifications/tools/list_changed",
-                    "notifications/prompts/list_changed",
-                    "notifications/resources/list_changed",
-                ] {
-                    let _ = state.notif_tx.send(
-                        crate::transport::build_notification(method, None),
-                    );
+                if was_respawn {
+                    // Step 2: refresh cache synchronously while holding the lock
+                    refresh_cache_from_backend(&guard, &state.cache).await;
+                    drop(guard);
+
+                    // Step 3: notify clients — cache is already up-to-date
+                    notify_clients_list_changed(state).await;
+                } else {
+                    drop(guard);
                 }
 
                 return Ok(());
@@ -436,6 +447,60 @@ async fn ensure_backend(state: &Arc<BrokerState>) -> Result<(), String> {
         dead.kill().await;
     }
     Err("backend spawn failed after 3 attempts".to_string())
+}
+
+/// Query all list/* endpoints from the live backend and update cache.
+/// Caller must hold the backend lock (guarantees backend is alive).
+async fn refresh_cache_from_backend(
+    be_guard: &tokio::sync::MutexGuard<'_, Option<Backend>>,
+    cache: &Arc<cache::Cache>,
+) {
+    let be = match be_guard.as_ref() {
+        Some(be) => be,
+        None => return,
+    };
+
+    let keys_methods = [
+        (router::CacheKey::ToolsList, "tools/list"),
+        (router::CacheKey::PromptsList, "prompts/list"),
+        (router::CacheKey::ResourcesList, "resources/list"),
+        (router::CacheKey::ResourceTemplatesList, "resources/templates/list"),
+    ];
+
+    for (key, method) in &keys_methods {
+        let req = transport::build_request(be.next_request_id(), method, None);
+        match tokio::time::timeout(Duration::from_secs(5), be.send_request(req)).await {
+            Ok(Ok(resp)) => {
+                if let Some(result) = resp.get("result").cloned() {
+                    cache.update(key, result);
+                    info!(method = *method, "broker: cache refreshed after respawn");
+                }
+            }
+            Ok(Err(e)) => warn!(method = *method, err = %e, "broker: cache refresh failed"),
+            Err(_) => warn!(method = *method, "broker: cache refresh timeout"),
+        }
+    }
+}
+
+/// Send list_changed notifications to all connected clients.
+/// Called after cache is already refreshed, so clients get fresh data.
+async fn notify_clients_list_changed(state: &Arc<BrokerState>) {
+    let notifications = [
+        "notifications/tools/list_changed",
+        "notifications/prompts/list_changed",
+        "notifications/resources/list_changed",
+    ];
+
+    let sessions = state.sessions.lock().await;
+    for method in &notifications {
+        let notif = transport::build_notification(method, None);
+        for (sid, tx) in sessions.iter() {
+            if tx.send(notif.clone()).is_err() {
+                debug!(session = sid, method = *method, "broker: notify channel closed");
+            }
+        }
+    }
+    info!("broker: sent list_changed to {} clients", sessions.len());
 }
 
 async fn spawn_and_init_backend(state: &Arc<BrokerState>) -> Result<Backend, String> {

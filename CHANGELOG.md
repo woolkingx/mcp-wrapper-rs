@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.1] - 2026-03-24
+
+### Fixed
+
+- **Daemon: keep init backend alive** — daemon/broker mode no longer kills the backend after cache init. The init backend is reused for serving requests, eliminating a redundant respawn on the first `tools/call`.
+- **Daemon: synchronous cache refresh on respawn** — when backend dies and is respawned on demand, cache is refreshed synchronously (query all `list/*` endpoints) **before** sending `list_changed` notifications to clients. This guarantees clients never read stale cache after receiving a notification.
+
+### Changed
+
+- Extracted `init_cache_inner()` from `init_cache()` to share logic between normal mode (kill backend after init) and daemon mode (keep backend alive)
+- Added `init_cache_with_backend()` public API for daemon/broker use
+- `ensure_backend()` in broker now uses dedicated `refresh_cache_from_backend()` + `notify_clients_list_changed()` instead of routing through the async fanout task
+- Notification to clients after respawn is sent directly to session channels, bypassing fanout task to guarantee ordering
+
 ## [0.4.0] - 2026-03-17
 
 ### Added

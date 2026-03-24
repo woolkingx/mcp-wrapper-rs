@@ -2,3 +2,8 @@
 log/
 __pycache__/
 *.rlib
+
+CLAUDE.md
+scripts/sync_release.py
+.cleanup/
+Cargo.lock
