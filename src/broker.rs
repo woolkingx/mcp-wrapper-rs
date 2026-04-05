@@ -51,6 +51,9 @@ pub fn start_broker_process(args: Vec<String>) {
         std::process::exit(1);
     }
 
+    let no_idle_timeout = args[cmd_start..].contains(&"--no-idle-timeout".to_string());
+    let cmd_start = if no_idle_timeout { cmd_start + 1 } else { cmd_start };
+
     let cmd = args[cmd_start].clone();
     let cmd_args: Vec<String> = args[cmd_start + 1..].to_vec();
 
@@ -59,10 +62,10 @@ pub fn start_broker_process(args: Vec<String>) {
         .build()
         .expect("broker: failed to create tokio runtime");
 
-    rt.block_on(broker_main(cmd, cmd_args, init_timeout));
+    rt.block_on(broker_main(cmd, cmd_args, init_timeout, no_idle_timeout));
 }
 
-async fn broker_main(cmd: String, cmd_args: Vec<String>, init_timeout: Duration) {
+async fn broker_main(cmd: String, cmd_args: Vec<String>, init_timeout: Duration, no_idle_timeout: bool) {
     let _tracing_guard = crate::init_tracing(&cmd, &cmd_args);
     info!(cmd = %cmd, version = env!("CARGO_PKG_VERSION"), "broker: starting");
 
@@ -172,7 +175,7 @@ async fn broker_main(cmd: String, cmd_args: Vec<String>, init_timeout: Duration)
                     Err(e) => warn!(err = %e, "broker: accept error"),
                 }
             }
-            _ = idle_check(&state) => {
+            _ = idle_check(&state, no_idle_timeout) => {
                 info!("broker: idle timeout, shutting down");
                 break;
             }
@@ -215,7 +218,11 @@ async fn broker_main(cmd: String, cmd_args: Vec<String>, init_timeout: Duration)
 /// 2. Idle: all sessions disconnected, no new ones for BROKER_IDLE_SECS → exit
 const ORPHAN_TIMEOUT_SECS: u64 = 120;
 
-async fn idle_check(state: &Arc<BrokerState>) {
+async fn idle_check(state: &Arc<BrokerState>, no_idle_timeout: bool) {
+    if no_idle_timeout {
+        std::future::pending::<()>().await;
+        return;
+    }
     let spawn_time = tokio::time::Instant::now();
     let mut last_active = spawn_time;
 

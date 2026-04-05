@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.2] - 2026-03-28
+
+### Fixed
+
+- **Daemon: no idle timeout** — broker spawned via `--daemon` no longer exits after 60s of no sessions. The broker now runs until explicit SIGTERM, matching the expected "always-on" daemon semantics. Non-daemon mode (relay) retains the 60s idle exit behavior unchanged.
+
+### Changed
+
+- `spawn_broker_process()` passes `--no-idle-timeout` to broker when spawned via `--daemon`
+- `idle_check()` accepts `no_idle_timeout: bool`; returns `pending()` immediately when set, preventing the idle shutdown path from ever triggering
+
 ## [0.4.1] - 2026-03-24
 
 ### Fixed

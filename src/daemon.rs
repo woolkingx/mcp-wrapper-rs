@@ -135,7 +135,7 @@ pub async fn connect_or_start_broker(
 /// Spawn the broker as a detached child process via `--broker-internal`.
 fn spawn_broker_process(cmd: &str, args: &[String]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
-    let mut broker_args = vec!["--broker-internal".to_string(), cmd.to_string()];
+    let mut broker_args = vec!["--broker-internal".to_string(), "--no-idle-timeout".to_string(), cmd.to_string()];
     broker_args.extend(args.iter().cloned());
 
     // Propagate init-timeout if set (broker reads it from env)
