@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Executor</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<p><a href="index.html">Back to handbook</a></p>
+<h1>Executor</h1>
+<section>
+  <h2>Execution Roles</h2>
+  <table>
+    <tr><th>Executor</th><th>May do</th><th>Must not do</th></tr>
+    <tr><td><code>mcp_interface</code></td><td>Read/write/build JSON-RPC, classify MCP and wrapper methods.</td><td>Own cache, backend process, or daemon state.</td></tr>
+    <tr><td><code>mcp_manager</code></td><td>Initialize backend, parse capabilities, refresh discovery cache, track cache epoch.</td><td>Spawn or kill child processes.</td></tr>
+    <tr><td><code>backend_manager</code></td><td>Spawn child, map responses, observe process state, execute restart/stop/ping hooks, kill process group.</td><td>Invent MCP method semantics or mutate cache directly.</td></tr>
+    <tr><td><code>runtime_manager</code></td><td>Run normal stdio loop, route requests, forward active peer responses.</td><td>Own backend lifecycle truth.</td></tr>
+    <tr><td><code>daemon_manager</code></td><td>Connect/start broker and relay bytes.</td><td>Own shared backend state.</td></tr>
+    <tr><td><code>broker_manager</code></td><td>Multiplex sessions, own active peer-session routing, coordinate shared backend/cache managers.</td><td>Broadcast request/response messages without ownership.</td></tr>
+  </table>
+</section>
+</main></body></html>

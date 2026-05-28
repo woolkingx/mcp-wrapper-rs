@@ -1,0 +1,138 @@
+[
+  {
+    "id": "edge-client-mcp-interface",
+    "from": "client.stdio",
+    "to": "mcp_interface.jsonrpc_message",
+    "edge": "sends",
+    "flow": ["data", "control", "error"],
+    "gate": "GATE-ROUTE-01"
+  },
+  {
+    "id": "edge-mcp-interface-runtime",
+    "from": "mcp_interface.route_decision",
+    "to": "runtime_manager.normal_dispatch",
+    "edge": "dispatches",
+    "flow": ["control", "data"],
+    "gate": "GATE-ROUTE-01"
+  },
+  {
+    "id": "edge-runtime-mcp-manager",
+    "from": "runtime_manager.cache_request",
+    "to": "mcp_manager.discovery_cache",
+    "edge": "reads",
+    "flow": ["data", "evidence"],
+    "gate": "GATE-CACHE-01"
+  },
+  {
+    "id": "edge-mcp-manager-backend-manager",
+    "from": "mcp_manager.initialize_or_refresh",
+    "to": "backend_manager.backend_process",
+    "edge": "requests",
+    "flow": ["data", "control", "error", "evidence"],
+    "gate": "GATE-CACHE-01"
+  },
+  {
+    "id": "edge-runtime-backend-manager",
+    "from": "runtime_manager.pass_through",
+    "to": "backend_manager.backend_process",
+    "edge": "forwards",
+    "flow": ["data", "control", "error"],
+    "gate": "GATE-PROXY-01"
+  },
+  {
+    "id": "edge-backend-child",
+    "from": "backend_manager.backend_process",
+    "to": "child.mcp_server",
+    "edge": "executes",
+    "flow": ["data", "control", "error", "evidence"],
+    "gate": "GATE-PROXY-01"
+  },
+  {
+    "id": "edge-daemon-broker-manager",
+    "from": "daemon_manager.uds_relay",
+    "to": "broker_manager.shared_runtime",
+    "edge": "multiplexes",
+    "flow": ["data", "control", "error", "evidence"],
+    "gate": "GATE-DAEMON-01"
+  },
+  {
+    "id": "edge-broker-mcp-manager",
+    "from": "broker_manager.cache_request",
+    "to": "mcp_manager.discovery_cache",
+    "edge": "reads",
+    "flow": ["data", "evidence"],
+    "gate": "GATE-CACHE-01"
+  },
+  {
+    "id": "edge-broker-backend-manager",
+    "from": "broker_manager.pass_through",
+    "to": "backend_manager.backend_process",
+    "edge": "forwards",
+    "flow": ["data", "control", "error"],
+    "gate": "GATE-DAEMON-01"
+  },
+  {
+    "id": "edge-backend-observe",
+    "from": "backend_manager.typed_backend_event",
+    "to": "mcp_manager.discovery_cache_epoch",
+    "edge": "observes-refreshes",
+    "flow": ["control", "state", "evidence"],
+    "gate": "GATE-BACKEND-OBS-01"
+  },
+  {
+    "id": "edge-wrapper-hook",
+    "from": "mcp_interface.wrapper_control_method",
+    "to": "backend_manager.lifecycle_hook",
+    "edge": "controls",
+    "flow": ["control", "evidence"],
+    "gate": "GATE-BACKEND-OBS-01"
+  },
+  {
+    "id": "edge-backend-request-client",
+    "from": "backend_manager.server_request",
+    "to": "runtime_manager.client_peer",
+    "edge": "requests",
+    "flow": ["control", "data", "evidence"],
+    "gate": "GATE-BIDI-01"
+  },
+  {
+    "id": "edge-client-response-backend",
+    "from": "runtime_manager.client_response",
+    "to": "backend_manager.server_request_waiter",
+    "edge": "responds",
+    "flow": ["data", "evidence"],
+    "gate": "GATE-BIDI-01"
+  },
+  {
+    "id": "edge-broker-backend-request-client",
+    "from": "backend_manager.server_request",
+    "to": "broker_manager.active_peer_session",
+    "edge": "requests",
+    "flow": ["control", "data", "evidence"],
+    "gate": "GATE-BIDI-01"
+  },
+  {
+    "id": "edge-broker-client-response-backend",
+    "from": "broker_manager.client_response",
+    "to": "backend_manager.server_request_waiter",
+    "edge": "responds",
+    "flow": ["data", "evidence"],
+    "gate": "GATE-BIDI-01"
+  },
+  {
+    "id": "edge-backend-circuit-breaker",
+    "from": "backend_manager.spawn_failure_state",
+    "to": "runtime_or_broker.pass_through_rejection",
+    "edge": "protects",
+    "flow": ["state", "control", "error", "evidence"],
+    "gate": "GATE-BACKEND-OBS-01"
+  },
+  {
+    "id": "edge-logging-runtime",
+    "from": "logging.command_identity",
+    "to": "runtime_manager.or_broker_tracing",
+    "edge": "labels",
+    "flow": ["evidence"],
+    "gate": "GATE-DOCS-01"
+  }
+]

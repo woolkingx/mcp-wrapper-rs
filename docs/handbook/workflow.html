@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Workflow</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<p><a href="index.html">Back to handbook</a></p>
+<h1>Workflow</h1>
+<section>
+  <h2>Change Route</h2>
+  <ol>
+    <li>Use local act rules for release gates; they are not part of the public release surface.</li>
+    <li>Use this handbook to locate the owning chapter and boundary.</li>
+    <li>If behavior changes, update handbook truth before code.</li>
+    <li>Update the owning manager or interface surgically; do not create a second control plane.</li>
+    <li>Run the proof route named by the gate before claiming completion.</li>
+  </ol>
+</section>
+<section>
+  <h2>Release Route</h2>
+  <p>Build release binaries with <code>cargo build --release</code>, verify CLI flags, run real-server smoke tests, check orphan processes, bump Cargo version, update changelog, and keep release branch decisions explicit.</p>
+</section>
+</main></body></html>

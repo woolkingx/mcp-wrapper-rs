@@ -30,6 +30,16 @@ QUICK=false
 WRAPPER="./target/release/mcp-wrapper-rs"
 ECHO_SERVER="python3 tests/fixtures/echo_server.py"
 
+cleanup_fixture_processes() {
+    pkill -TERM -f "mcp-wrapper-rs --broker-internal.*[t]ests/fixtures/echo_server.py" 2>/dev/null || true
+    pkill -TERM -f "[t]ests/fixtures/echo_server.py" 2>/dev/null || true
+    sleep 0.2
+    pkill -KILL -f "mcp-wrapper-rs --broker-internal.*[t]ests/fixtures/echo_server.py" 2>/dev/null || true
+    pkill -KILL -f "[t]ests/fixtures/echo_server.py" 2>/dev/null || true
+}
+
+cleanup_fixture_processes
+
 # ── Layer 1: cargo test ──────────────────────────────────────────────
 
 echo "=== Layer 1: cargo test ==="
@@ -112,7 +122,8 @@ pipe_test "consecutive calls IDs" \
 
 # Test: --version flag
 version_output=$($WRAPPER --version 2>&1)
-if echo "$version_output" | grep -q "0.3.0"; then
+expected_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')
+if echo "$version_output" | grep -q "mcp-wrapper-rs $expected_version"; then
     pass "--version"
 else
     fail "--version" "got: $version_output"
@@ -147,12 +158,19 @@ pipe_test "no orphan (basic)" \
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"msg":"orphan-check"}}}' \
     'orphan-check'
 sleep 1
-orphans=$(pgrep -f "echo_server.py" 2>/dev/null | wc -l || true)
+orphans=0
+for _ in {1..10}; do
+    orphans=$(pgrep -f "^[^ ]*python3 tests/fixtures/echo_server.py" 2>/dev/null | wc -l || true)
+    if [ "$orphans" -eq 0 ]; then
+        break
+    fi
+    sleep 0.5
+done
 if [ "$orphans" -eq 0 ]; then
     pass "no orphan processes"
 else
-    fail "no orphan processes" "$orphans echo_server.py still running"
-    pkill -f "echo_server.py" 2>/dev/null || true
+    fail "no orphan processes" "$orphans fixture echo_server.py still running"
+    cleanup_fixture_processes
 fi
 
 # ── Layer 3: Janix mcp-validator (STDIO compliance) ──────────────────

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Proof</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<p><a href="index.html">Back to handbook</a></p>
+<h1>Proof</h1>
+<section>
+  <h2>Proof Surface</h2>
+  <table>
+    <tr><th>Gate</th><th>Command or file</th><th>What it proves</th></tr>
+    <tr><td><code>GATE-ROUTE-01</code></td><td><code>cargo test mcp_interface_tests</code></td><td>Method routing table and JSON-RPC interface helpers stay stable.</td></tr>
+    <tr><td><code>GATE-CACHE-01</code></td><td><a href="../../tests/conformance.rs">tests/conformance.rs</a></td><td>JSON-RPC and MCP response envelopes conform.</td></tr>
+    <tr><td><code>GATE-PROXY-01</code></td><td><a href="../../tests/integration.rs">tests/integration.rs</a></td><td>End-to-end stdio wrapper flow, ID restore, backend reuse, and server-to-client request roundtrip.</td></tr>
+    <tr><td><code>GATE-BIDI-01</code></td><td><code>cargo test --test integration server_request_roundtrip</code> and <code>cargo test --test integration daemon_server_request_roundtrip</code></td><td>Server-initiated MCP requests reach the active client and client responses return to the backend.</td></tr>
+    <tr><td><code>GATE-DAEMON-01</code></td><td><a href="../../scripts/test-daemon.sh">scripts/test-daemon.sh</a></td><td>Daemon relay, broker reuse, CLI flags.</td></tr>
+    <tr><td><code>GATE-BACKEND-OBS-01</code></td><td><code>cargo test --test backend_hooks</code> and peer bridge integration tests</td><td>Backend state, generation, cache epoch, restart, refresh, degraded cooldown, readback evidence, and request-scoped peer bridge behavior.</td></tr>
+    <tr><td><code>GATE-CLI-01</code></td><td><code>cargo test --test integration cli_admin_</code> and <a href="../../scripts/test-daemon.sh">scripts/test-daemon.sh</a></td><td>Admin CLI projects daemon, broker, backend, and MCP cache owner readback without a second lifecycle path.</td></tr>
+    <tr><td><code>GATE-RELEASE-01</code></td><td><a href="../../scripts/test-all.sh">scripts/test-all.sh</a></td><td>Release build, cargo tests, pipe smoke, optional validator.</td></tr>
+  </table>
+</section>
+<section>
+  <h2>Current Caution</h2>
+  <p>The handbook records proof routes, not current pass status. Always run the relevant command in the current worktree before claiming a gate is green.</p>
+</section>
+</main></body></html>

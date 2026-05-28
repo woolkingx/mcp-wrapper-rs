@@ -1,0 +1,21 @@
+flowchart TD
+  client["MCP client stdio"] --> iface["mcp_interface JSON-RPC line and route"]
+  iface -->|initialize and list methods| cache["mcp_manager discovery cache"]
+  cache --> iface_out["mcp_interface response line"]
+  iface -->|ping| runtime_local["runtime_manager local result"]
+  runtime_local --> iface_out
+  iface -->|dynamic or future methods| runtime["runtime_manager pass-through"]
+  runtime --> backend["backend_manager Backend"]
+  backend --> child["child MCP server stdio"]
+  child --> backend
+  backend -->|restore client id| iface_out
+  child -->|notifications| observe["backend_manager typed event"]
+  observe --> invalidation["mcp_manager list_changed refresh"]
+  invalidation --> cache
+  invalidation --> iface_out
+  child -->|server request| peer["runtime_manager or broker_manager active client"]
+  peer -->|client response| backend
+  daemon_client["daemon client stdio"] --> daemon["daemon_manager UDS relay"]
+  daemon --> broker["broker_manager shared runtime"]
+  broker --> cache
+  broker --> backend

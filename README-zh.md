@@ -70,9 +70,30 @@ mcp-wrapper-rs python3 /path/to/server.py
 # 使用環境變數（從父進程繼承）
 SEARXNG_URL=http://localhost:8080 mcp-wrapper-rs npx -y mcp-searxng
 
-# 使用自訂初始化超時（預設 5 秒；啟動較慢的伺服器可調高）
+# 使用自訂初始化超時（預設 30 秒；啟動較慢的伺服器可調高）
 mcp-wrapper-rs --init-timeout 15 npx -y mcp-searxng
+
+# Daemon 模式：多個 client 共用同一個 broker/backend
+mcp-wrapper-rs --daemon python3 /path/to/server.py
 ```
+
+### Admin CLI
+
+Admin CLI 是同一套 daemon、broker、backend、MCP cache owner 的狀態投影與控制入口，不是第二套後端管理器。
+
+```bash
+# 查看某個 command identity 的 broker/backend 狀態
+mcp-wrapper-rs status --json -- python3 /path/to/server.py
+
+# 需要時啟動 broker，重啟 backend，並刷新 MCP cache data
+mcp-wrapper-rs backend restart --start --json -- python3 /path/to/server.py
+
+# 查看或停止該 command identity 對應的 broker
+mcp-wrapper-rs broker status --json -- python3 /path/to/server.py
+mcp-wrapper-rs broker stop --json -- python3 /path/to/server.py
+```
+
+唯讀 admin command 不會啟動 broker，除非明確加上 `--start`。
 
 ### Claude Code 設定
 
@@ -97,7 +118,7 @@ mcp-wrapper-rs --init-timeout 15 npx -y mcp-searxng
     "my-python-server": {
       "type": "stdio",
       "command": "/path/to/mcp-wrapper-rs",
-      "args": ["python3", "/path/to/server.py"]
+      "args": ["--daemon", "python3", "/path/to/server.py"]
     }
   }
 }
@@ -106,9 +127,9 @@ mcp-wrapper-rs --init-timeout 15 npx -y mcp-searxng
 ## 運作原理
 
 1. **初始化階段**
-   - 啟動子進程，透過 rmcp SDK 完成 MCP 握手
-   - 查詢 `tools/list`、`prompts/list`、`resources/list`、`resources/templates/list`（支援分頁）
-   - 每個查詢有可設定的超時（`--init-timeout`，預設 5 秒）；無回應的伺服器會被跳過
+   - 啟動子進程，透過 raw JSON-RPC 完成 MCP 握手
+   - 查詢 `tools/list`、`prompts/list`、`resources/list`、`resources/templates/list`
+   - 每個查詢有可設定的超時（`--init-timeout`，預設 30 秒）；無回應的伺服器會被跳過
    - 快取所有結果，終止初始化子進程
 
 2. **運行階段**
@@ -121,7 +142,7 @@ mcp-wrapper-rs --init-timeout 15 npx -y mcp-searxng
 3. **資源管理**
    - 持久化後端子進程跨工具呼叫重複使用
    - 後端進程死亡時，下次呼叫自動重啟
-   - rmcp SDK 負責進程生命週期和協議細節
+   - wrapper 負責 process group 清理、backend lifecycle、cache refresh readback
 
 ## 除錯日誌
 

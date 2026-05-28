@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Schema</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<p><a href="index.html">Back to handbook</a></p>
+<h1>Schema</h1>
+<section>
+  <h2>Legal Shapes</h2>
+  <p>The executable contract is JSON-RPC 2.0 over line-delimited stdio plus MCP method envelopes. The repository does not currently have a root <code>schema.json</code>; proof uses <a href="../../tests/fixtures/mcp-schema.json">tests/fixtures/mcp-schema.json</a> and the conformance validator.</p>
+  <table>
+    <tr><th>Shape</th><th>Owner</th><th>Gate</th></tr>
+    <tr><td>Request with id and method</td><td><a href="../../src/mcp_interface.rs">mcp_interface.rs</a></td><td><code>GATE-ROUTE-01</code></td></tr>
+    <tr><td>Notification with method and no id</td><td><a href="../../src/mcp_interface.rs">mcp_interface.rs</a></td><td><code>GATE-ROUTE-01</code></td></tr>
+    <tr><td>Initialize result capabilities</td><td><a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td><code>GATE-CACHE-01</code></td></tr>
+    <tr><td>Wrapper backend hook method</td><td><a href="../../src/mcp_interface.rs">mcp_interface.rs</a></td><td><code>GATE-BACKEND-OBS-01</code></td></tr>
+    <tr><td>Backend state snapshot and MCP cache epoch</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a> and <a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td><code>GATE-BACKEND-OBS-01</code></td></tr>
+    <tr><td>Backend degraded cooldown fields</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td><code>GATE-BACKEND-OBS-01</code></td></tr>
+    <tr><td>Typed backend observe event</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td><code>GATE-BACKEND-OBS-01</code></td></tr>
+    <tr><td>Server-to-client peer request and client response</td><td><a href="../../src/runtime_manager.rs">runtime_manager.rs</a> and <a href="../../src/broker_manager.rs">broker_manager.rs</a></td><td><code>GATE-PROXY-01</code></td></tr>
+    <tr><td>JSON-RPC response and error envelope</td><td><a href="../../tests/conformance.rs">conformance.rs</a></td><td><code>GATE-CACHE-01</code></td></tr>
+  </table>
+</section>
+<section>
+  <h2>Rule</h2>
+  <p>New protocol shape support starts with route ownership and conformance proof. Hook responses must be local wrapper JSON-RPC results with stable fields for backend generation, cache epoch, state, and readback evidence.</p>
+</section>
+</main></body></html>

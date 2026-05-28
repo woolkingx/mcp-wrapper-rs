@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Data</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<p><a href="index.html">Back to handbook</a></p>
+<h1>Data</h1>
+<section>
+  <h2>Primary Product Data</h2>
+  <p>The primary data is small: JSON-RPC messages carrying MCP methods and MCP discovery/call content. Backend lifecycle, daemon sockets, cache epochs, and logs are supporting state, control, or evidence data. They exist to keep the primary MCP data flowing correctly; they are not the product data itself.</p>
+  <table>
+    <tr><th>Primary data</th><th>Owner</th><th>Meaning</th></tr>
+    <tr><td>JSON-RPC request, response, and notification envelopes</td><td><code>mcp_interface</code></td><td>The legal transport shape across client, wrapper, and child server stdio.</td></tr>
+    <tr><td>MCP tool/resource/prompt discovery results</td><td><code>mcp_manager</code></td><td>The stable capability surface cached and replayed by the wrapper.</td></tr>
+    <tr><td>MCP dynamic calls and backend replies</td><td><code>runtime_manager</code> or <code>broker_manager</code> composition over <code>backend_manager</code></td><td>The request-scoped data that must pass through without semantic ownership by the wrapper.</td></tr>
+  </table>
+</section>
+<section>
+  <h2>Data And State Owners</h2>
+  <table>
+    <tr><th>Data node</th><th>Target owner</th><th>Current evidence</th><th>Invariant</th></tr>
+    <tr><td>JSON-RPC line and MCP method envelope</td><td><code>mcp_interface</code></td><td><a href="../../src/mcp_interface.rs">mcp_interface.rs</a></td><td>Protocol shape and route classification never spawn or mutate backend state.</td></tr>
+    <tr><td>MCP session and discovery cache</td><td><code>mcp_manager</code></td><td><a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td>Cached discovery is scoped by backend generation, capabilities, and cache epoch.</td></tr>
+    <tr><td>Backend process slot</td><td><code>backend_manager</code></td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td>Spawn, retry, kill, stderr, generation, degraded state, and restart policy have one owner.</td></tr>
+    <tr><td>Wrapper hook methods</td><td><code>mcp_interface</code> route, <code>backend_manager</code>/<code>mcp_manager</code> action</td><td><a href="../../tests/backend_hooks.rs">backend hook tests</a></td><td>Wrapper controls are local JSON-RPC methods unless explicitly exposed as tools.</td></tr>
+    <tr><td>Observed backend events</td><td><code>backend_manager</code> event classification, <code>mcp_manager</code> cache reaction</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td>Notifications are signals, not lifecycle truth.</td></tr>
+    <tr><td>Normal runtime</td><td><code>runtime_manager</code></td><td><a href="../../src/runtime_manager.rs">runtime_manager.rs</a></td><td>Stdio loop routes decisions; it does not own protocol schema or backend lifecycle truth.</td></tr>
+    <tr><td>Daemon broker runtime</td><td><code>daemon_manager</code> and <code>broker_manager</code></td><td><a href="../../src/daemon_manager.rs">daemon_manager.rs</a>, <a href="../../src/broker_manager.rs">broker_manager.rs</a></td><td>Daemon relay owns socket coordination; broker owns shared session/backend routing.</td></tr>
+  </table>
+</section>
+<section>
+  <h2>Named Unknowns</h2>
+  <p>The wrapper does not know backend semantics beyond MCP capabilities, response envelopes, health signals, and explicit hook readback. It also cannot assume a daemon-shared backend is safe for stateful servers; README keeps that as a user-facing boundary.</p>
+</section>
+</main></body></html>

@@ -101,12 +101,30 @@ The first wrapper auto-spawns the broker; subsequent wrappers connect to it. The
 - Backend subprocess lifecycle (lazy spawn, respawn on failure)
 - Request multiplexing with ID remapping
 - Notification fanout to all connected clients
-- Graceful shutdown: idle exit after 60s with no sessions
+- Graceful shutdown: broker spawned via `--daemon` runs until explicit SIGTERM
 
 Coordination uses flock + PID file + Unix domain socket under `$XDG_RUNTIME_DIR/mcp-wrapper/`.
 
 **When to use**: Stateless MCP servers shared across multiple Claude Code sessions.
 **When NOT to use**: Stateful servers (e.g., browser automation) where each session needs its own backend.
+
+### Admin CLI
+
+The admin CLI is a readback/control projection over the same daemon, broker, backend, and MCP cache owners used at runtime. It does not manage backend processes through a second code path.
+
+```bash
+# Read broker/backend status for a command identity
+mcp-wrapper-rs status --json -- python3 /path/to/server.py
+
+# Start the broker if needed, then restart the backend and refresh MCP cache data
+mcp-wrapper-rs backend restart --start --json -- python3 /path/to/server.py
+
+# Inspect or stop the broker for the command identity
+mcp-wrapper-rs broker status --json -- python3 /path/to/server.py
+mcp-wrapper-rs broker stop --json -- python3 /path/to/server.py
+```
+
+Read-only admin commands do not start a broker unless `--start` is present.
 
 ### Claude Code Configuration
 
@@ -217,7 +235,9 @@ Tested with:
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
+Start with the [handbook](docs/handbook/index.html) for the current architecture
+map, owner boundaries, flow projections, and proof gates. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the older compact architecture note.
 
 ## License
 

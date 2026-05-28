@@ -1,0 +1,35 @@
+flowchart TD
+  start["process start"] --> flags["main.rs parse flags before runtime"]
+  flags -->|normal| normal["runtime_manager::run_normal"]
+  normal --> init["mcp_manager::init_cache temporary backend"]
+  init --> serve["runtime_manager event loop"]
+  serve --> route["mcp_interface::route"]
+  route -->|Cache| cache_read["mcp_manager Cache::lookup"]
+  route -->|Local| ping["empty ping result"]
+  route -->|PassThrough| ensure["backend_manager BackendSlot::ensure"]
+  ensure -->|spawn failures| degraded["degraded cooldown circuit breaker"]
+  degraded -->|normal call| reject_cooldown["immediate JSON-RPC error"]
+  degraded -->|force restart| state["backend_manager generation state"]
+  ensure --> call_task["serialized pass-through request task"]
+  call_task --> call["Backend::send_request"]
+  call --> peer_req{"backend peer request?"}
+  peer_req -->|yes| outbound["runtime_manager outbound writer"]
+  outbound --> client_resp["client JSON-RPC response"]
+  client_resp --> backend_write["Backend::send_message"]
+  backend_write --> call
+  peer_req -->|no| call_done["restore client id"]
+  call_done --> outbound
+  outbound --> serve
+  serve --> observe["typed backend event or hook request"]
+  observe --> state
+  state --> refresh["mcp_manager cache epoch refresh"]
+  refresh --> evidence["status result or list_changed after readback"]
+  evidence --> serve
+  serve --> shutdown["backend_manager kill_all_pgids on EOF or signal"]
+  flags -->|--daemon| connect["daemon_manager::connect_or_start_broker"]
+  connect --> relay["daemon_manager::run_relay stdio to UDS"]
+  relay --> broker["broker_manager session handler"]
+  broker --> shared_route["broker route and shared backend"]
+  shared_route --> peer_owner["broker_manager active peer session"]
+  peer_owner -->|unassociated| reject_peer["JSON-RPC error to backend"]
+  shared_route --> broker_shutdown["broker shutdown or SIGTERM"]

@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mcp-wrapper-rs Handbook</title>
+  <style>
+    :root { color-scheme: light dark; --fg:#17212b; --muted:#5f6b75; --bg:#f7f8fb; --panel:#fff; --line:#d8dee4; --accent:#1f6feb; --ok:#1a7f37; --warn:#9a6700; }
+    @media (prefers-color-scheme: dark) { :root { --fg:#e6edf3; --muted:#9da7b1; --bg:#0d1117; --panel:#161b22; --line:#30363d; --accent:#58a6ff; --ok:#3fb950; --warn:#d29922; } }
+    * { box-sizing: border-box; }
+    body { margin:0; font:16px/1.5 system-ui, sans-serif; color:var(--fg); background:var(--bg); }
+    header { padding:28px 32px 18px; border-bottom:1px solid var(--line); background:var(--panel); }
+    main { display:grid; grid-template-columns:300px minmax(0,1fr); gap:24px; padding:24px 32px 48px; }
+    nav { position:sticky; top:16px; align-self:start; border:1px solid var(--line); border-radius:8px; padding:14px; background:var(--panel); }
+    nav a { display:block; padding:5px 0; color:var(--accent); text-decoration:none; }
+    nav details { margin:10px 0 0; }
+    nav summary { cursor:pointer; font-weight:700; }
+    nav details a { padding-left:14px; }
+    section { margin:0 0 18px; border:1px solid var(--line); border-radius:8px; padding:18px; background:var(--panel); }
+    h1, h2, h3 { margin:0 0 10px; line-height:1.2; }
+    p { margin:8px 0; }
+    code { padding:1px 4px; border-radius:4px; background:rgba(127,127,127,.15); }
+    table { width:100%; border-collapse:collapse; margin-top:8px; }
+    th, td { border:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; }
+    th { background:rgba(127,127,127,.10); }
+    .tag { display:inline-block; margin:2px 6px 2px 0; padding:2px 7px; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:13px; }
+    .flow { white-space:pre-wrap; padding:12px; border-radius:8px; background:rgba(127,127,127,.12); overflow:auto; }
+    @media (max-width:800px) { main { display:block; padding:16px; } nav { position:static; margin-bottom:16px; } header { padding:22px 16px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>mcp-wrapper-rs Handbook</h1>
+    <p>A system atlas for the Rust MCP stdio wrapper: protocol boundary, cache policy, backend lifecycle, daemon broker topology, and proof gates.</p>
+    <p><span class="tag">raw JSON-RPC</span><span class="tag">cache-first proxy</span><span class="tag">process-group cleanup</span><span class="tag">daemon broker</span></p>
+  </header>
+  <main>
+    <nav aria-label="Handbook navigation">
+      <strong>Handbook Tree</strong>
+      <a href="../../README.md">Quickstart</a>
+      <a href="../../CHANGELOG.md">Changelog</a>
+      <details open>
+        <summary>Spine</summary>
+        <a href="index.html">Index</a>
+        <a href="doctrine.html">Doctrine</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="data.html">Data</a>
+        <a href="schema.html">Schema</a>
+        <a href="topology.html">Topology</a>
+        <a href="flow.html">Flow</a>
+        <a href="logic.html">Logic</a>
+        <a href="executor.html">Executor</a>
+        <a href="proof.html">Proof</a>
+        <a href="workflow.html">Workflow</a>
+        <a href="documentation-architecture.html">Documentation Architecture</a>
+      </details>
+      <details open>
+        <summary>Projections</summary>
+        <a href="../../artifacts/flowgraph/data-flow.mmd">Data Flow</a>
+        <a href="../../artifacts/flowgraph/control-flow.mmd">Control Flow</a>
+        <a href="../../artifacts/flowgraph/boundary-edges.json">Boundary Edges</a>
+      </details>
+      <details open>
+        <summary>Markdown Files</summary>
+        <a href="../../README.md">README quickstart</a>
+        <a href="../../README-zh.md">Chinese README</a>
+        <a href="../../ARCHITECTURE.md">Legacy architecture note</a>
+        <a href="../../CHANGELOG.md">Changelog</a>
+        <a href="../../LICENSE">License</a>
+      </details>
+      <details>
+        <summary>Runtime Owners</summary>
+        <a href="../../src/mcp_interface.rs">mcp_interface.rs</a>
+        <a href="../../src/mcp_manager.rs">mcp_manager.rs</a>
+        <a href="../../src/backend_manager.rs">backend_manager.rs</a>
+        <a href="../../src/runtime_manager.rs">runtime_manager.rs</a>
+        <a href="../../src/daemon_manager.rs">daemon_manager.rs</a>
+        <a href="../../src/broker_manager.rs">broker_manager.rs</a>
+        <a href="../../src/logging.rs">logging.rs</a>
+        <a href="../../src/main.rs">main.rs</a>
+      </details>
+      <details>
+        <summary>Proof</summary>
+        <a href="../../tests/conformance.rs">Conformance tests</a>
+        <a href="../../tests/integration.rs">Integration tests</a>
+        <a href="../../scripts/test-all.sh">Full smoke script</a>
+        <a href="../../scripts/test-daemon.sh">Daemon smoke script</a>
+      </details>
+    </nav>
+    <div>
+      <section id="summary">
+        <h2>Project Summary</h2>
+        <p><code>mcp-wrapper-rs</code> wraps stdio MCP servers with a lightweight Rust proxy. It answers stable MCP discovery requests from cache and forwards dynamic calls to a child MCP server only when needed. Normal mode gives each wrapper its own lazy backend; daemon mode lets multiple wrapper sessions share one broker and one backend.</p>
+        <div class="flow">client stdio -> mcp_interface -> runtime_manager -> mcp_manager | backend_manager -> child MCP server
+daemon client stdio -> daemon_manager -> broker_manager -> mcp_manager | backend_manager</div>
+      </section>
+      <section id="reader-contract">
+        <h2>Reader Contract</h2>
+        <p>Use <a href="../../README.md">README.md</a> for install and usage. Use this handbook for architecture truth, owner boundaries, data/state/control flow, and gates. Local agent act rules and execution plans are not part of the public release surface. Use tests and scripts only as proof surfaces, not as architecture sources.</p>
+      </section>
+      <section id="source-map">
+        <h2>Source Of Truth Map</h2>
+        <table>
+          <tr><th>Concern</th><th>Owner</th><th>Evidence</th></tr>
+          <tr><td>Product promise and usage</td><td><a href="../../README.md">README.md</a></td><td>Install, CLI flags, examples</td></tr>
+          <tr><td>Architecture and boundary truth</td><td><a href="architecture.html">docs/handbook/architecture.html</a></td><td>stdio scope, data owners, planes, hook/observe control, admin projection</td></tr>
+          <tr><td>Runtime rules for agents</td><td>Local act rules</td><td>Critical rules and release checklist stay outside the public release surface.</td></tr>
+          <tr><td>Protocol routing</td><td><a href="../../src/mcp_interface.rs">src/mcp_interface.rs</a></td><td><code>route()</code> and MCP data key tests</td></tr>
+          <tr><td>Proof</td><td><a href="../../tests/integration.rs">tests/</a> and <a href="../../scripts/test-all.sh">scripts/</a></td><td>Conformance, integration, smoke checks</td></tr>
+        </table>
+      </section>
+      <section id="chapter-map">
+        <h2>Chapter Map</h2>
+        <table>
+          <tr><th>Chapter</th><th>Question</th><th>Primary owner</th></tr>
+          <tr><td><a href="doctrine.html">Doctrine</a></td><td>What principle keeps the wrapper simple?</td><td>Cache what is static, proxy what is dynamic.</td></tr>
+          <tr><td><a href="architecture.html">Architecture</a></td><td>How is the product structured?</td><td>stdio wrapper scope, JSON-RPC and MCP data owners, hook/observe control plane, CLI admin projection.</td></tr>
+          <tr><td><a href="data.html">Data</a></td><td>What exists at runtime?</td><td>Primary JSON-RPC envelopes, MCP tool/resource/prompt data, and supporting backend/cache/daemon state.</td></tr>
+          <tr><td><a href="schema.html">Schema</a></td><td>What shape is legal?</td><td>JSON-RPC 2.0, MCP envelopes, wrapper hook responses, backend snapshots.</td></tr>
+          <tr><td><a href="topology.html">Topology</a></td><td>Which crossings are allowed?</td><td>Owner modules, backend process boundary, hook/observe boundary, daemon broker.</td></tr>
+          <tr><td><a href="flow.html">Flow</a></td><td>How does state move?</td><td>Init cache, pass-through ID remap, observe-state-hook-readback evidence.</td></tr>
+          <tr><td><a href="logic.html">Logic</a></td><td>What transition may happen?</td><td>Route decision, capability filtering, generation state, cache epoch, lifecycle hooks.</td></tr>
+          <tr><td><a href="executor.html">Executor</a></td><td>Who executes only?</td><td>mcp_interface, mcp_manager, backend_manager, runtime, daemon, broker managers.</td></tr>
+          <tr><td><a href="proof.html">Proof</a></td><td>What proves it?</td><td>Cargo tests, smoke scripts, live server checks.</td></tr>
+          <tr><td><a href="workflow.html">Workflow</a></td><td>How should maintainers act?</td><td>Docs-first changes with release gates.</td></tr>
+        </table>
+      </section>
+      <section id="gate-families">
+        <h2>Gate Families</h2>
+        <table>
+          <tr><th>Gate</th><th>Statement</th><th>Proof route</th></tr>
+          <tr><td><code>GATE-ROUTE-01</code></td><td>Static MCP discovery requests are served from cache; future or dynamic methods pass through.</td><td><a href="../../src/mcp_interface.rs">interface tests</a>, <a href="../../tests/integration.rs">integration tests</a></td></tr>
+          <tr><td><code>GATE-CACHE-01</code></td><td>Cache init respects declared capabilities and returns empty compliant results for unsupported lists.</td><td><a href="../../tests/conformance.rs">conformance tests</a></td></tr>
+          <tr><td><code>GATE-PROXY-01</code></td><td>Pass-through calls remap IDs, reuse a live backend, and clean process groups on exit.</td><td><a href="../../tests/integration.rs">integration tests</a>, <a href="../../tests/check_orphans.py">orphan check</a></td></tr>
+          <tr><td><code>GATE-BIDI-01</code></td><td>Server-initiated MCP requests reach the active client and client responses return to the backend.</td><td><code>cargo test --test integration server_request_roundtrip</code>, <code>cargo test --test integration daemon_server_request_roundtrip</code></td></tr>
+          <tr><td><code>GATE-DAEMON-01</code></td><td>Daemon mode multiplexes clients through one broker-owned backend.</td><td><a href="../../scripts/test-daemon.sh">daemon smoke</a>, <a href="../../tests/integration.rs">daemon integration tests</a></td></tr>
+          <tr><td><code>GATE-BACKEND-OBS-01</code></td><td>Backend hook/observe control reports state, refreshes cache by generation, restarts safely, and emits client-visible change evidence only after cache readback.</td><td><a href="../../tests/backend_hooks.rs">backend hook tests</a></td></tr>
+          <tr><td><code>GATE-CLI-01</code></td><td>Admin CLI projects owner readback and control without creating a second backend lifecycle manager.</td><td><a href="../../tests/integration.rs">admin CLI integration tests</a></td></tr>
+          <tr><td><code>GATE-DOCS-01</code></td><td>Public docs stay reachable from this handbook tree.</td><td>handbook link check</td></tr>
+        </table>
+      </section>
+      <section id="reading-order">
+        <h2>Reading Order</h2>
+        <p>For usage, read README first. For architecture work, read <a href="doctrine.html">Doctrine</a>, <a href="architecture.html">Architecture</a>, <a href="topology.html">Topology</a>, <a href="flow.html">Flow</a>, then <a href="proof.html">Proof</a>. For implementation, read the owning Rust file after the chapter names its boundary.</p>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Logic</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<p><a href="index.html">Back to handbook</a></p>
+<h1>Logic</h1>
+<section>
+  <h2>Transitions</h2>
+  <table>
+    <tr><th>Decision</th><th>Rule owner</th><th>Result</th></tr>
+    <tr><td>Method route</td><td><a href="../../src/mcp_interface.rs">mcp_interface.rs</a></td><td>Cache, local ping, wrapper control, or pass-through.</td></tr>
+    <tr><td>Capability support</td><td><a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td>Query supported list method or cache empty result.</td></tr>
+    <tr><td>Backend readiness</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td>Reuse, respawn, refresh cache, or return JSON-RPC error.</td></tr>
+    <tr><td>Backend hook/observe control</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a> and <a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td>Observe state, restart or refresh through local hooks, increment generation/cache epoch, then publish readback evidence.</td></tr>
+    <tr><td>Backend spawn storm</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td>After repeated spawn failures, enter degraded cooldown; only forced restart may bypass the cooldown.</td></tr>
+    <tr><td>Backend peer request</td><td><a href="../../src/runtime_manager.rs">runtime_manager.rs</a> and <a href="../../src/broker_manager.rs">broker_manager.rs</a></td><td>Relay only through the active request scope; broker mode rejects unassociated backend requests.</td></tr>
+    <tr><td>Daemon coordination</td><td><a href="../../src/daemon_manager.rs">daemon_manager.rs</a></td><td>Connect existing broker or spawn one under lock.</td></tr>
+  </table>
+</section>
+<section>
+  <h2>Invariants</h2>
+  <p>Route decisions stay pure. Backend request IDs are internal and must be restored before the client sees the response. Process groups are killed explicitly before runtime exit. Hook/observe control must not treat arbitrary notifications as lifecycle truth. Peer responses must be forwarded without holding the backend slot mutex that protects lifecycle state. Spawn failures must become observable degraded state instead of repeated blind respawn attempts.</p>
+</section>
+</main></body></html>

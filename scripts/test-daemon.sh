@@ -7,17 +7,14 @@ ECHO="$(dirname "$0")/../tests/fixtures/echo_server.py"
 PASS=0
 FAIL=0
 
-pass() { echo "  PASS: $1"; ((PASS++)); }
-fail() { echo "  FAIL: $1"; ((FAIL++)); }
+pass() { echo "  PASS: $1"; ((PASS += 1)); }
+fail() { echo "  FAIL: $1"; ((FAIL += 1)); }
 
 cleanup_broker() {
     # Kill any lingering broker for this echo_server
-    local sock
-    sock=$(ls "$XDG_RUNTIME_DIR/mcp-wrapper/"*.sock 2>/dev/null || true)
-    if [ -n "$sock" ]; then
-        fuser -k "$sock" 2>/dev/null || true
-        rm -f "$sock"
-    fi
+    pkill -TERM -f "mcp-wrapper-rs --broker-internal.*[t]ests/fixtures/echo_server.py" 2>/dev/null || true
+    sleep 0.2
+    pkill -KILL -f "mcp-wrapper-rs --broker-internal.*[t]ests/fixtures/echo_server.py" 2>/dev/null || true
 }
 
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}'
@@ -61,7 +58,8 @@ fi
 echo "=== Test 3: Daemon mode - second client reuses broker ==="
 # Broker should still be alive from test 2 (60s idle timeout)
 # Check socket exists
-SOCKS=$(ls "$XDG_RUNTIME_DIR/mcp-wrapper/"*.sock 2>/dev/null | wc -l)
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/mcp-wrapper"
+SOCKS=$(ls "$RUNTIME_DIR/"*.sock 2>/dev/null | wc -l)
 if [ "$SOCKS" -ge 1 ]; then
     pass "broker socket exists after first client"
 else
@@ -80,8 +78,45 @@ else
     fail "second client: tools/list failed"
 fi
 
-# ── Test 4: --version and --help still work ───────────────────────
-echo "=== Test 4: CLI flags ==="
+# ── Test 4: Admin CLI readback ────────────────────────────────────
+echo "=== Test 4: Admin CLI readback ==="
+ADMIN_STATUS=$("$WRAPPER" broker status --json -- python3 "$ECHO" 2>/dev/null)
+if echo "$ADMIN_STATUS" | grep -q '"running":true'; then
+    pass "admin: broker status running"
+else
+    fail "admin: broker status not running"
+fi
+
+ADMIN_PING=$("$WRAPPER" backend ping --json -- python3 "$ECHO" 2>/dev/null)
+if echo "$ADMIN_PING" | grep -q '"ok":true'; then
+    pass "admin: backend ping OK"
+else
+    fail "admin: backend ping failed"
+fi
+
+ADMIN_STOP=$("$WRAPPER" backend stop --json -- python3 "$ECHO" 2>/dev/null)
+if echo "$ADMIN_STOP" | grep -q '"state":"stopped"'; then
+    pass "admin: backend stop readback"
+else
+    fail "admin: backend stop missing stopped state"
+fi
+
+BROKER_STOP=$("$WRAPPER" broker stop --json -- python3 "$ECHO" 2>/dev/null)
+if echo "$BROKER_STOP" | grep -q '"running":false'; then
+    pass "admin: broker stop readback"
+else
+    fail "admin: broker stop missing stopped readback"
+fi
+
+BROKER_AFTER=$("$WRAPPER" broker status --json -- python3 "$ECHO" 2>/dev/null)
+if echo "$BROKER_AFTER" | grep -q '"running":false'; then
+    pass "admin: broker status stopped"
+else
+    fail "admin: broker still running after stop"
+fi
+
+# ── Test 5: --version and --help still work ───────────────────────
+echo "=== Test 5: CLI flags ==="
 if "$WRAPPER" --version 2>&1 | grep -q "mcp-wrapper-rs"; then
     pass "--version works"
 else

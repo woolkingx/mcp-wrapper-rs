@@ -1,5 +1,8 @@
 # Architecture
 
+Current architecture truth lives in [docs/handbook/index.html](docs/handbook/index.html).
+This file remains a compact legacy note and quick orientation surface.
+
 ## Design Philosophy
 
 **Unix Philosophy**: Do one thing well — transparent protocol proxying with intelligent caching.
@@ -20,7 +23,7 @@ Handles raw JSON-RPC 2.0 directly — no SDK dependency for protocol handling.
 │  └─────────┘   └────────┘   │ Notify     → relay        │   (on-demand)
 │                              └───────────────────────────┘      │
 │  ┌─────────┐                                                     │
-│  │ Stdout  │◀── transport.rs writes JSON-RPC responses ─────────│
+│  │ Stdout  │◀── mcp_interface.rs writes JSON-RPC responses ─────│
 │  │(JSON-RPC)│                                                     │
 │  └─────────┘                                                     │
 └──────────────────────────────────────────────────────────────────┘
@@ -30,11 +33,12 @@ Handles raw JSON-RPC 2.0 directly — no SDK dependency for protocol handling.
 
 | module | responsibility |
 |--------|---------------|
-| `transport.rs` | Line-delimited JSON-RPC read/write, message builders (response, error, notification) |
-| `router.rs` | Classify methods as Cached, PassThrough, or Notification; extract params |
-| `cache.rs` | Spawn init subprocess, query all list endpoints, store results, handle invalidation |
-| `proxy.rs` | Backend lifecycle: lazy spawn, health check, request/response matching via oneshot channels |
-| `main.rs` | CLI parsing, signal handling, event loop wiring router + cache + proxy |
+| `mcp_interface.rs` | Line-delimited JSON-RPC read/write, message builders, method route classification |
+| `mcp_manager.rs` | Initialize handshake, capability-aware discovery cache, cache refresh |
+| `backend_manager.rs` | Backend lifecycle: lazy spawn, health check, request/response matching via oneshot channels |
+| `runtime_manager.rs` | Normal stdio loop, request dispatch, idle reaper, peer-response forwarding |
+| `daemon_manager.rs` / `broker_manager.rs` | Daemon client relay and shared broker runtime |
+| `main.rs` | CLI parsing and top-level dispatch |
 
 ## Request Flow
 
@@ -101,7 +105,7 @@ Wrapper                              Subprocess (init, temporary)
 ## Backend Lifecycle
 
 - **Lazy spawn**: Backend created on first pass-through request
-- **Retry**: 3 attempts with exponential backoff (100ms, 200ms, 400ms)
+- **Retry**: 3 attempts with exponential backoff (1s, 2s, 4s)
 - **Full handshake**: Each spawn performs MCP initialize + initialized sequence
 - **Health check**: Verify child process alive before forwarding
 - **Graceful shutdown**: SIGTERM → 5s wait → SIGKILL

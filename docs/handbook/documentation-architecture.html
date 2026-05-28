@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Documentation Architecture</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<p><a href="index.html">Back to handbook</a></p>
+<h1>Documentation Architecture</h1>
+<section>
+  <h2>Layer Responsibilities</h2>
+  <table>
+    <tr><th>Layer</th><th>Owns</th><th>Must not</th></tr>
+    <tr><td><code>docs/handbook/*.html</code></td><td>Architecture, topology, flow, gates, canonical status.</td><td>Become a changelog or quickstart clone.</td></tr>
+    <tr><td><code>README.md</code></td><td>Public promise, install, usage, links.</td><td>Own long-form architecture truth.</td></tr>
+    <tr><td><code>CLAUDE.md</code></td><td>Agent act rules, local invariants, release checklist.</td><td>Grow into the full handbook.</td></tr>
+    <tr><td><code>docs/plan/*.md</code></td><td>Temporary action plan and verification list.</td><td>Create new architecture semantics.</td></tr>
+    <tr><td><code>tests/</code></td><td>Proof and regressions.</td><td>Replace architecture explanation.</td></tr>
+  </table>
+</section>
+<section>
+  <h2>Maintenance Rules</h2>
+  <ul>
+    <li>Keep active Markdown reachable from <a href="index.html">index.html</a>.</li>
+    <li>Use 200 lines as the split checkpoint and 500 as the hard maximum per handbook file.</li>
+    <li>Flowgraph files are projections of handbook truth, not replacement truth.</li>
+    <li>When README and handbook disagree, fix the stale surface instead of letting both compete.</li>
+  </ul>
+</section>
+</main></body></html>

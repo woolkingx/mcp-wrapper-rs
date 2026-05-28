@@ -7,3 +7,4 @@ CLAUDE.md
 scripts/sync_release.py
 .cleanup/
 Cargo.lock
+docs/plan/

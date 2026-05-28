@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Architecture</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<p><a href="index.html">Back to handbook</a></p>
+<h1>Architecture</h1>
+<section>
+  <h2>Scope</h2>
+  <p><code>mcp-wrapper-rs</code> is a stdio MCP wrapper. Its runtime contract is newline-delimited JSON-RPC over stdin/stdout on both sides: client to wrapper, wrapper to child MCP server. Streamable HTTP, OAuth, remote hosting, and multi-transport negotiation are outside the current architecture until a separate transport owner, schema, topology, and proof gate are added.</p>
+  <p>The project moved from one lightweight mixed proxy to owner-oriented modules. The primary product data is JSON-RPC messages and MCP tool/resource/prompt content. Backend lifecycle, daemon sockets, cache epochs, and logs are supporting state or evidence. The target shape is a data-owner map where primary data stays simple, every supporting state node has one owner, every crossing has one legal route, and every control action has readback evidence.</p>
+</section>
+<section>
+  <h2>Architecture Thesis</h2>
+  <pre>stdio wrapper
+-> JSON-RPC envelope owner
+-> MCP tool/resource/prompt discovery owner
+-> backend process owner
+-> runtime or broker composition owner
+-> hook/observe control plane
+-> proof by tests, smoke, and readback</pre>
+  <p>The wrapper should be smarter about backend state through hooks and observation, not through scattered direct wiring. Observation turns backend events into typed state. Hooks request a legal transition. Readback proves the new state before clients, logs, or CLI projections claim it.</p>
+</section>
+<section>
+  <h2>Owner Map</h2>
+  <table>
+    <tr><th>Owner</th><th>Owns</th><th>Must not own</th></tr>
+    <tr><td><a href="../../src/main.rs"><code>main.rs</code></a></td><td>CLI flag parse, version/help, top-level normal/daemon/broker dispatch.</td><td>Runtime policy, protocol semantics, backend lifecycle decisions.</td></tr>
+    <tr><td><a href="../../src/mcp_interface.rs"><code>mcp_interface</code></a></td><td>JSON-RPC line read/write, request/response/notification classification, MCP method route table, wrapper control method names.</td><td>Cache mutation, backend spawn/kill, daemon socket state.</td></tr>
+    <tr><td><a href="../../src/mcp_manager.rs"><code>mcp_manager</code></a></td><td>MCP initialize handshake, tool/resource/prompt discovery cache, capability filtering, cache epoch, refresh reports.</td><td>Child process lifecycle, client stdio loop, broker sessions.</td></tr>
+    <tr><td><a href="../../src/backend_manager.rs"><code>backend_manager</code></a></td><td>Child process slot, stdin/stdout/stderr, pending response match, process group, generation, degraded state, restart/stop/ping hooks.</td><td>MCP list semantics, cache writes, client routing policy.</td></tr>
+    <tr><td><a href="../../src/runtime_manager.rs"><code>runtime_manager</code></a></td><td>Normal stdio loop, active call guard, pass-through composition, idle reaper, server-to-client response bridge.</td><td>Protocol schema, durable cache truth, daemon lock ownership.</td></tr>
+    <tr><td><a href="../../src/daemon_manager.rs"><code>daemon_manager</code></a></td><td>UDS path, lock, pid/meta files, stale broker cleanup, client relay to broker.</td><td>Shared backend state or MCP routing.</td></tr>
+    <tr><td><a href="../../src/broker_manager.rs"><code>broker_manager</code></a></td><td>Shared daemon sessions, one backend/cache pair, fanout, active peer-session routing, broker-side wrapper hooks.</td><td>Daemon spawn lock, protocol schema invention, unsafe broadcast of request/response traffic.</td></tr>
+    <tr><td><a href="../../src/logging.rs"><code>logging</code></a></td><td>Command identity, log path, tracing setup.</td><td>Runtime decisions or backend state.</td></tr>
+  </table>
+</section>
+<section>
+  <h2>Planes</h2>
+  <table>
+    <tr><th>Plane</th><th>Path</th><th>Rule</th></tr>
+    <tr><td>Data plane</td><td><code>client stdio -> mcp_interface -> runtime_manager -> mcp_manager | backend_manager -> child stdio</code></td><td>JSON-RPC envelopes carry MCP discovery and dynamic call data. Requests either read cached MCP tool/resource/prompt data, return local wrapper response, or pass through with ID restoration.</td></tr>
+    <tr><td>Daemon data plane</td><td><code>client stdio -> daemon_manager UDS relay -> broker_manager -> mcp_manager | backend_manager</code></td><td>Daemon clients do not own backend state. The broker owns the shared backend/cache pair.</td></tr>
+    <tr><td>Control plane</td><td><code>observe -> owner state -> hook -> transition -> readback -> evidence</code></td><td>No component may infer backend truth from a notification alone.</td></tr>
+    <tr><td>Evidence plane</td><td><code>snapshot, generation, cache epoch, pid/meta, logs, tests, smoke</code></td><td>Status is a readback product, not a hope attached to a command.</td></tr>
+  </table>
+</section>
+<section>
+  <h2>Hook And Observe Contract</h2>
+  <table>
+    <tr><th>Node</th><th>Current shape</th><th>Owner</th></tr>
+    <tr><td>Backend observation</td><td>Backend stdout/stderr, unmatched responses, list_changed notifications, process exit, degraded cooldown.</td><td><code>backend_manager</code> classifies process facts; <code>runtime_manager</code> and <code>broker_manager</code> compose reactions.</td></tr>
+    <tr><td>Backend status hook</td><td><code>mcp-wrapper/backend/status</code> returns backend snapshot plus MCP cache snapshot.</td><td><code>mcp_interface</code> names the method; runtime/broker call <code>backend_manager</code> and <code>mcp_manager</code>.</td></tr>
+    <tr><td>Backend refresh hook</td><td><code>mcp-wrapper/backend/refresh</code> refreshes discovery cache from the live backend and returns epoch readback.</td><td><code>mcp_manager</code>.</td></tr>
+    <tr><td>Backend restart hook</td><td><code>mcp-wrapper/backend/restart</code> restarts via backend slot, then refreshes cache before success evidence.</td><td><code>backend_manager</code> transition, <code>mcp_manager</code> readback.</td></tr>
+    <tr><td>Backend stop/ping hooks</td><td><code>mcp-wrapper/backend/stop</code> and <code>mcp-wrapper/backend/ping</code> expose local wrapper control.</td><td><code>backend_manager</code>.</td></tr>
+  </table>
+  <p>Notifications remain signals. They may trigger observation or cache refresh, but they do not become lifecycle truth until the owning manager publishes a snapshot or refresh report.</p>
+</section>
+<section>
+  <h2>Admin CLI Projection</h2>
+  <p>The admin surface is a projection over the same hook/observe owners, not a second backend manager. A CLI command may read status, request restart, stop, refresh, list broker metadata, or run doctor checks only by calling the owning manager path and printing readback.</p>
+  <pre>mcp-wrapper-rs status --json -- &lt;command&gt; [args...]
+mcp-wrapper-rs backend status|ping|refresh|restart|stop --json -- &lt;command&gt; [args...]
+mcp-wrapper-rs broker list|status|stop|restart --json -- &lt;command&gt; [args...]
+mcp-wrapper-rs doctor --json -- &lt;command&gt; [args...]</pre>
+  <p>CLI output is evidence projection. It must not directly mutate pid files, sockets, cache maps, or child processes except through <code>daemon_manager</code>, <code>broker_manager</code>, <code>backend_manager</code>, and <code>mcp_manager</code> APIs.</p>
+</section>
+<section>
+  <h2>Daemon Boundary</h2>
+  <p>Daemon mode is an optimization for sharing one backend among compatible wrapper sessions. It is safe only when the wrapped server can tolerate shared session/backend state. Stateful or per-client servers should use normal mode unless the server's own semantics explicitly allow sharing.</p>
+  <p>Server-to-client requests are request-scoped. The broker routes them to the active peer session and rejects unassociated backend requests instead of broadcasting them. Notifications can fan out only when the MCP method is a legal notification and cache readback has already been refreshed when required.</p>
+</section>
+<section>
+  <h2>Proof Boundary</h2>
+  <table>
+    <tr><th>Claim</th><th>Proof owner</th><th>Gate</th></tr>
+    <tr><td>Protocol route and wrapper controls are stable.</td><td>Separated Rust tests beside the crate test root, not product operator bodies.</td><td><code>cargo test mcp_interface_tests</code></td></tr>
+    <tr><td>Backend hooks and observe flow work.</td><td><a href="../../tests/backend_hooks.rs">tests/backend_hooks.rs</a> plus integration peer bridge tests.</td><td><code>GATE-BACKEND-OBS-01</code></td></tr>
+    <tr><td>Daemon sharing and bidirectional MCP traffic hold.</td><td><a href="../../tests/integration.rs">tests/integration.rs</a> and <a href="../../scripts/test-daemon.sh">scripts/test-daemon.sh</a>.</td><td><code>GATE-BIDI-01</code>, <code>GATE-DAEMON-01</code></td></tr>
+    <tr><td>Docs stay navigable and architecture-owned.</td><td>Handbook link, Markdown coverage, and line audits.</td><td><code>GATE-DOCS-01</code></td></tr>
+  </table>
+</section>
+<section>
+  <h2>Change Rule</h2>
+  <p>New behavior starts by naming the data node, owner, legal crossing, transition, and proof gate in the handbook. Code then becomes the executable projection. Tests prove the owner transform or composition boundary. Product code must not become a hiding place for durable tests, debug probes, or second control planes.</p>
+</section>
+</main></body></html>

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Topology</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<p><a href="index.html">Back to handbook</a></p>
+<h1>Topology</h1>
+<section>
+  <h2>Allowed Crossings</h2>
+  <pre>client stdio -> mcp_interface -> runtime_manager -> mcp_manager | backend_manager -> child MCP server
+daemon client stdio -> daemon_manager -> broker_manager -> mcp_manager | backend_manager -> shared child MCP server
+backend observe signal -> backend_manager state -> mcp_manager cache epoch -> runtime_manager | broker_manager evidence
+wrapper hook method -> mcp_interface -> backend_manager | mcp_manager -> readback response</pre>
+</section>
+<section>
+  <h2>Owner Edges</h2>
+  <table>
+    <tr><th>From</th><th>To</th><th>Edge</th></tr>
+    <tr><td><code>mcp_interface</code></td><td><code>mcp_manager</code></td><td>Only cacheable MCP methods may read discovery cache.</td></tr>
+    <tr><td><code>mcp_interface</code></td><td><code>backend_manager</code></td><td>Only wrapper hook methods may control backend lifecycle.</td></tr>
+    <tr><td><code>runtime_manager</code>/<code>broker_manager</code></td><td><code>backend_manager</code></td><td>Only pass-through calls and legal hooks may reach backend process state.</td></tr>
+    <tr><td><code>backend_manager</code></td><td><code>mcp_manager</code></td><td>Observed process or protocol signals may trigger cache refresh, never ad hoc cache mutation.</td></tr>
+    <tr><td><code>daemon_manager</code></td><td><code>broker_manager</code></td><td>Daemon clients cross through UDS, not direct backend ownership.</td></tr>
+  </table>
+</section>
+<section>
+  <h2>Projection</h2>
+  <p>The machine-readable edge list is <a href="../../artifacts/flowgraph/boundary-edges.json">artifacts/flowgraph/boundary-edges.json</a>.</p>
+</section>
+</main></body></html>

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Doctrine</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<p><a href="index.html">Back to handbook</a></p>
+<h1>Doctrine</h1>
+<section>
+  <h2>Constitution</h2>
+  <p>The wrapper does one job: keep MCP stdio servers cheap when they are idle while preserving raw JSON-RPC behavior for dynamic work.</p>
+  <p>The controlling rule is: cache what is static, proxy what is dynamic. The wrapper must not become an MCP SDK, rule engine, or semantic owner of backend behavior.</p>
+</section>
+<section>
+  <h2>First Principles</h2>
+  <ul>
+    <li>JSON-RPC line protocol is the transport boundary.</li>
+    <li>MCP initialize and list results are stable enough to cache after backend handshake.</li>
+    <li>Tool calls, resource reads, prompts, completions, logging, subscriptions, and unknown future methods belong to the backend.</li>
+    <li>Backend subprocesses are external resources and must be isolated in process groups.</li>
+    <li>Daemon sharing is legal only when a single backend is correct for the server's state model.</li>
+  </ul>
+</section>
+<section>
+  <h2>Rejected Drift</h2>
+  <p>Do not justify new layers with generic proxy patterns. A new owner is legal only when this handbook, the route table, and proof gates name the boundary.</p>
+</section>
+</main></body></html>

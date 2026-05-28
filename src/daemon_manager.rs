@@ -4,14 +4,16 @@
 //! over a Unix domain socket instead of spawning its own backend. If no broker
 //! is running, one is spawned automatically with flock-based coordination.
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::time::UNIX_EPOCH;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 
-use crate::cmd_hash;
+use crate::logging::cmd_hash;
 
 /// Check if PID in file is still alive. Returns Some(pid) if alive, None if stale/missing.
 fn read_alive_pid(pid_path: &std::path::Path) -> Option<u32> {
@@ -23,10 +25,28 @@ fn read_alive_pid(pid_path: &std::path::Path) -> Option<u32> {
 }
 
 /// Paths used for daemon coordination.
+#[derive(Debug, Clone)]
 pub struct DaemonPaths {
+    pub hash: String,
     pub socket: PathBuf,
     pub lock: PathBuf,
     pub pid: PathBuf,
+    pub meta: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrokerStatus {
+    pub hash: String,
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub socket_exists: bool,
+    pub lock_exists: bool,
+    pub meta: Option<serde_json::Value>,
+    pub meta_matches_current_exe: bool,
+    pub socket: PathBuf,
+    pub lock: PathBuf,
+    pub pid_path: PathBuf,
+    pub meta_path: PathBuf,
 }
 
 /// Compute socket and lock paths for a given command + args.
@@ -35,16 +55,179 @@ pub struct DaemonPaths {
 /// Falls back to `/tmp/mcp-wrapper/` if XDG_RUNTIME_DIR is unset.
 pub fn daemon_paths(cmd: &str, args: &[String]) -> DaemonPaths {
     let hash = cmd_hash(cmd, args);
-    let base = if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(xdg).join("mcp-wrapper")
-    } else {
-        PathBuf::from("/tmp/mcp-wrapper")
-    };
+    let base = daemon_base_dir();
     DaemonPaths {
+        hash: hash.clone(),
         socket: base.join(format!("{}.sock", hash)),
         lock: base.join(format!("{}.lock", hash)),
         pid: base.join(format!("{}.pid", hash)),
+        meta: base.join(format!("{}.meta.json", hash)),
     }
+}
+
+fn daemon_base_dir() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(xdg).join("mcp-wrapper")
+    } else {
+        PathBuf::from("/tmp/mcp-wrapper")
+    }
+}
+
+fn paths_for_hash(base: &Path, hash: &str) -> DaemonPaths {
+    DaemonPaths {
+        hash: hash.to_string(),
+        socket: base.join(format!("{}.sock", hash)),
+        lock: base.join(format!("{}.lock", hash)),
+        pid: base.join(format!("{}.pid", hash)),
+        meta: base.join(format!("{}.meta.json", hash)),
+    }
+}
+
+fn current_broker_meta() -> Result<serde_json::Value, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
+    let metadata = std::fs::metadata(&exe).map_err(|e| format!("exe metadata: {}", e))?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    Ok(serde_json::json!({
+        "wrapperVersion": env!("CARGO_PKG_VERSION"),
+        "exe": exe.to_string_lossy(),
+        "exeLen": metadata.len(),
+        "exeModifiedMs": modified_ms,
+    }))
+}
+
+pub fn write_broker_meta(paths: &DaemonPaths) -> Result<(), String> {
+    let meta = current_broker_meta()?;
+    let body = serde_json::to_string(&meta).map_err(|e| format!("serialize broker meta: {}", e))?;
+    std::fs::write(&paths.meta, body).map_err(|e| format!("write broker meta: {}", e))
+}
+
+fn broker_meta_matches(paths: &DaemonPaths) -> bool {
+    let Ok(current) = current_broker_meta() else {
+        return false;
+    };
+    let Ok(body) = std::fs::read_to_string(&paths.meta) else {
+        return false;
+    };
+    let Ok(existing) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    existing == current
+}
+
+pub fn broker_status(paths: &DaemonPaths) -> BrokerStatus {
+    let meta = std::fs::read_to_string(&paths.meta)
+        .ok()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok());
+    let pid = read_alive_pid(&paths.pid);
+    let socket_exists = paths.socket.exists();
+    BrokerStatus {
+        hash: paths.hash.clone(),
+        running: pid.is_some() && socket_exists,
+        pid,
+        socket_exists,
+        lock_exists: paths.lock.exists(),
+        meta,
+        meta_matches_current_exe: broker_meta_matches(paths),
+        socket: paths.socket.clone(),
+        lock: paths.lock.clone(),
+        pid_path: paths.pid.clone(),
+        meta_path: paths.meta.clone(),
+    }
+}
+
+pub fn list_brokers() -> Result<Vec<BrokerStatus>, String> {
+    let base = daemon_base_dir();
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut hashes = BTreeSet::new();
+    let entries = std::fs::read_dir(&base).map_err(|e| format!("read daemon dir: {}", e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read daemon entry: {}", e))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(hash) = name.strip_suffix(".sock") {
+            hashes.insert(hash.to_string());
+        } else if let Some(hash) = name.strip_suffix(".lock") {
+            hashes.insert(hash.to_string());
+        } else if let Some(hash) = name.strip_suffix(".pid") {
+            hashes.insert(hash.to_string());
+        } else if let Some(hash) = name.strip_suffix(".meta.json") {
+            hashes.insert(hash.to_string());
+        }
+    }
+
+    Ok(hashes
+        .into_iter()
+        .map(|hash| broker_status(&paths_for_hash(&base, &hash)))
+        .collect())
+}
+
+pub async fn connect_existing_broker(paths: &DaemonPaths) -> Result<UnixStream, String> {
+    let status = broker_status(paths);
+    if !status.running {
+        return Err("broker is not running; pass --start to start it".to_string());
+    }
+    if !status.meta_matches_current_exe {
+        return Err("broker metadata mismatch; restart the broker".to_string());
+    }
+    UnixStream::connect(&paths.socket)
+        .await
+        .map_err(|e| format!("connect broker: {}", e))
+}
+
+pub async fn stop_broker(paths: &DaemonPaths) -> Result<BrokerStatus, String> {
+    if let Some(pid) = read_alive_pid(&paths.pid) {
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if read_alive_pid(&paths.pid).is_none() {
+                break;
+            }
+        }
+        if read_alive_pid(&paths.pid).is_some() {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    let _ = std::fs::remove_file(&paths.pid);
+    let _ = std::fs::remove_file(&paths.socket);
+    let _ = std::fs::remove_file(&paths.meta);
+    Ok(broker_status(paths))
+}
+
+pub async fn restart_broker(
+    paths: &DaemonPaths,
+    cmd: &str,
+    args: &[String],
+    init_timeout: Duration,
+) -> Result<UnixStream, String> {
+    let _ = stop_broker(paths).await?;
+    connect_or_start_broker(paths, cmd, args, init_timeout).await
+}
+
+async fn remove_stale_broker(paths: &DaemonPaths, reason: &str) {
+    if let Some(old_pid) = read_alive_pid(&paths.pid) {
+        warn!(pid = old_pid, reason, "daemon: killing stale broker");
+        unsafe {
+            libc::kill(old_pid as libc::pid_t, libc::SIGTERM);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let _ = std::fs::remove_file(&paths.pid);
+    let _ = std::fs::remove_file(&paths.socket);
+    let _ = std::fs::remove_file(&paths.meta);
 }
 
 /// Connect to an existing broker, or spawn one if none is running.
@@ -57,15 +240,19 @@ pub async fn connect_or_start_broker(
     args: &[String],
     init_timeout: Duration,
 ) -> Result<UnixStream, String> {
+    // Ensure directory exists
+    std::fs::create_dir_all(paths.socket.parent().unwrap())
+        .map_err(|e| format!("create daemon dir: {}", e))?;
+
+    if paths.socket.exists() && !broker_meta_matches(paths) {
+        remove_stale_broker(paths, "metadata mismatch").await;
+    }
+
     // Attempt 1: try connecting directly
     if let Ok(stream) = UnixStream::connect(&paths.socket).await {
         info!("daemon: connected to existing broker");
         return Ok(stream);
     }
-
-    // Ensure directory exists
-    std::fs::create_dir_all(paths.socket.parent().unwrap())
-        .map_err(|e| format!("create daemon dir: {}", e))?;
 
     // Open lock file
     let lock_file = std::fs::OpenOptions::new()
@@ -81,7 +268,9 @@ pub async fn connect_or_start_broker(
 
     if i_am_spawner {
         // We hold the lock. Race check: try connecting again.
-        if let Ok(stream) = UnixStream::connect(&paths.socket).await {
+        if paths.socket.exists() && !broker_meta_matches(paths) {
+            remove_stale_broker(paths, "metadata mismatch after lock").await;
+        } else if let Ok(stream) = UnixStream::connect(&paths.socket).await {
             info!("daemon: broker appeared during lock acquisition");
             return Ok(stream);
         }
@@ -89,17 +278,20 @@ pub async fn connect_or_start_broker(
         // Check for stale PID file — if process is dead, clean up socket + pid
         if let Some(old_pid) = read_alive_pid(&paths.pid) {
             // Process alive but socket connect failed — stale socket or broker stuck
-            warn!(pid = old_pid, "daemon: broker PID alive but socket unreachable, killing");
-            unsafe { libc::kill(old_pid as libc::pid_t, libc::SIGTERM); }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            warn!(
+                pid = old_pid,
+                "daemon: broker PID alive but socket unreachable"
+            );
+            remove_stale_broker(paths, "socket unreachable").await;
         }
         // Clean up stale files before spawning
         let _ = std::fs::remove_file(&paths.pid);
         let _ = std::fs::remove_file(&paths.socket);
+        let _ = std::fs::remove_file(&paths.meta);
 
         // We are the spawner. Launch broker as a detached subprocess.
         info!("daemon: spawning broker");
-        spawn_broker_process(cmd, args)?;
+        spawn_broker_process(cmd, args, init_timeout)?;
 
         // Wait for broker to become ready (socket appears and accepts)
         let deadline = tokio::time::Instant::now() + init_timeout + Duration::from_secs(5);
@@ -109,6 +301,10 @@ pub async fn connect_or_start_broker(
                 return Err("broker did not become ready in time".to_string());
             }
             if let Ok(stream) = UnixStream::connect(&paths.socket).await {
+                if !broker_meta_matches(paths) {
+                    remove_stale_broker(paths, "metadata mismatch after spawn").await;
+                    return Err("broker metadata mismatch after spawn".to_string());
+                }
                 info!("daemon: connected to new broker");
                 return Ok(stream);
             }
@@ -123,6 +319,10 @@ pub async fn connect_or_start_broker(
         // Broker should be ready now. Connect with retries.
         for _ in 0..20 {
             if let Ok(stream) = UnixStream::connect(&paths.socket).await {
+                if !broker_meta_matches(paths) {
+                    remove_stale_broker(paths, "metadata mismatch after lock wait").await;
+                    return Err("broker metadata mismatch after lock wait".to_string());
+                }
                 info!("daemon: connected after lock wait");
                 return Ok(stream);
             }
@@ -133,13 +333,16 @@ pub async fn connect_or_start_broker(
 }
 
 /// Spawn the broker as a detached child process via `--broker-internal`.
-fn spawn_broker_process(cmd: &str, args: &[String]) -> Result<(), String> {
+fn spawn_broker_process(cmd: &str, args: &[String], init_timeout: Duration) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
-    let mut broker_args = vec!["--broker-internal".to_string(), "--no-idle-timeout".to_string(), cmd.to_string()];
+    let mut broker_args = vec![
+        "--broker-internal".to_string(),
+        "--init-timeout".to_string(),
+        init_timeout.as_secs().max(1).to_string(),
+        "--no-idle-timeout".to_string(),
+        cmd.to_string(),
+    ];
     broker_args.extend(args.iter().cloned());
-
-    // Propagate init-timeout if set (broker reads it from env)
-    // Propagate debug settings
     let mut command = std::process::Command::new(exe);
     command.args(&broker_args);
     command.stdin(std::process::Stdio::null());
@@ -157,7 +360,9 @@ fn spawn_broker_process(cmd: &str, args: &[String]) -> Result<(), String> {
     }
 
     use std::os::unix::process::CommandExt;
-    let child = command.spawn().map_err(|e| format!("spawn broker: {}", e))?;
+    let child = command
+        .spawn()
+        .map_err(|e| format!("spawn broker: {}", e))?;
     // Don't wait — let the broker run independently.
     // The child handle is dropped, but the process continues because it's in a new session.
     std::mem::forget(child);
@@ -180,9 +385,8 @@ pub async fn run_relay(stream: UnixStream) -> Result<(), String> {
     let mut stdout = tokio::io::stdout();
 
     #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate(),
-    ).ok();
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
 
     // Spawn stdin→UDS forwarder as a separate task.
     // When stdin hits EOF, we shutdown the UDS write side but keep
@@ -256,26 +460,4 @@ pub async fn run_relay(stream: UnixStream) -> Result<(), String> {
 
     stdin_task.abort();
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn daemon_paths_produces_hash_based_paths() {
-        let paths = daemon_paths("python3", &["server.py".to_string()]);
-        let hash = cmd_hash("python3", &["server.py".to_string()]);
-        assert!(paths.socket.to_str().unwrap().contains(&hash));
-        assert!(paths.socket.to_str().unwrap().ends_with(".sock"));
-        assert!(paths.lock.to_str().unwrap().ends_with(".lock"));
-        assert!(paths.pid.to_str().unwrap().ends_with(".pid"));
-    }
-
-    #[test]
-    fn daemon_paths_different_args_different_hash() {
-        let p1 = daemon_paths("python3", &["a.py".to_string()]);
-        let p2 = daemon_paths("python3", &["b.py".to_string()]);
-        assert_ne!(p1.socket, p2.socket);
-    }
 }
