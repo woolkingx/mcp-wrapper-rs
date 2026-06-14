@@ -10,6 +10,7 @@
     <tr><th>Primary data</th><th>Owner</th><th>Meaning</th></tr>
     <tr><td>JSON-RPC request, response, and notification envelopes</td><td><code>mcp_interface</code></td><td>The legal transport shape across client, wrapper, and child server stdio.</td></tr>
     <tr><td>MCP tool/resource/prompt discovery results</td><td><code>mcp_manager</code></td><td>The stable capability surface cached and replayed by the wrapper.</td></tr>
+    <tr><td>Wrapper tool action data</td><td><code>tools</code></td><td>The <code>mcp.wrapper</code> descriptor, action names, action params, validation rules, and unified readback envelope.</td></tr>
     <tr><td>MCP dynamic calls and backend replies</td><td><code>runtime_manager</code> or <code>broker_manager</code> composition over <code>backend_manager</code></td><td>The request-scoped data that must pass through without semantic ownership by the wrapper.</td></tr>
   </table>
 </section>
@@ -19,8 +20,9 @@
     <tr><th>Data node</th><th>Target owner</th><th>Current evidence</th><th>Invariant</th></tr>
     <tr><td>JSON-RPC line and MCP method envelope</td><td><code>mcp_interface</code></td><td><a href="../../src/mcp_interface.rs">mcp_interface.rs</a></td><td>Protocol shape and route classification never spawn or mutate backend state.</td></tr>
     <tr><td>MCP session and discovery cache</td><td><code>mcp_manager</code></td><td><a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td>Cached discovery is scoped by backend generation, capabilities, and cache epoch.</td></tr>
+    <tr><td><code>mcp.wrapper</code> tool descriptor and invocation</td><td><code>tools</code></td><td><a href="../../src/tools/mod.rs">src/tools</a></td><td>The wrapper exposes one backend-visible management tool; action params are validated before owner APIs are called.</td></tr>
     <tr><td>Backend process slot</td><td><code>backend_manager</code></td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td>Spawn, retry, kill, stderr, generation, degraded state, and restart policy have one owner.</td></tr>
-    <tr><td>Wrapper hook methods</td><td><code>mcp_interface</code> route, <code>backend_manager</code>/<code>mcp_manager</code> action</td><td><a href="../../tests/backend_hooks.rs">backend hook tests</a></td><td>Wrapper controls are local JSON-RPC methods unless explicitly exposed as tools.</td></tr>
+    <tr><td>Wrapper hook methods</td><td><code>mcp_interface</code> route, <code>backend_manager</code>/<code>mcp_manager</code> action</td><td><a href="../plan/2026-05-28-backend-hook-observe.md">backend hook/observe plan</a></td><td>Wrapper controls are local JSON-RPC methods unless explicitly exposed as tools.</td></tr>
     <tr><td>Observed backend events</td><td><code>backend_manager</code> event classification, <code>mcp_manager</code> cache reaction</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td>Notifications are signals, not lifecycle truth.</td></tr>
     <tr><td>Normal runtime</td><td><code>runtime_manager</code></td><td><a href="../../src/runtime_manager.rs">runtime_manager.rs</a></td><td>Stdio loop routes decisions; it does not own protocol schema or backend lifecycle truth.</td></tr>
     <tr><td>Daemon broker runtime</td><td><code>daemon_manager</code> and <code>broker_manager</code></td><td><a href="../../src/daemon_manager.rs">daemon_manager.rs</a>, <a href="../../src/broker_manager.rs">broker_manager.rs</a></td><td>Daemon relay owns socket coordination; broker owns shared session/backend routing.</td></tr>

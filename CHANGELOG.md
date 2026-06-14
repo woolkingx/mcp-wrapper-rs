@@ -1,5 +1,77 @@
 # Changelog
 
+## [0.5.0] - 2026-06-14
+
+Supervisor-proxy milestone. This release fills gaps that plain stdio MCP leaves
+open: a client cannot control the lifecycle of the server it is connected to,
+there is no standard backend-state readback, idle servers still cost memory, and
+every client spawns its own backend. mcp-wrapper-rs closes all four behind one
+stable transport.
+
+### What it fills in over plain stdio MCP
+
+- **Backend lifecycle control** — plain MCP gives the client no way to restart,
+  stop, refresh, or inspect the server it talks to. The unified `mcp.wrapper`
+  tool exposes `restart` / `stop` / `refresh` / `status` / `ping`, and a backend
+  restart never drops the client-facing transport.
+- **Unified readback / observability** — plain MCP has no standard backend
+  status surface. An `observe -> hook -> readback` control plane turns backend
+  facts into proven state (snapshot, generation, cache epoch, discovery hash)
+  before any client, log, or CLI reports it.
+- **Cache-first stable discovery layer** — plain MCP servers keep consuming
+  memory while idle. The wrapper caches stable discovery data and spawns the
+  backend lazily, so an idle wrapper is near-free.
+- **Backend sharing across clients** — plain MCP makes every client spawn its
+  own server. Daemon mode shares one backend/cache pair across sessions through
+  a broker, with broker-global active-call safety.
+
+### Added
+
+- **Unified `mcp.wrapper` tool** — one reserved backend-visible tool injected
+  into `tools/list`. Backend `status`, `ping`, `refresh`, `restart`, and `stop`
+  are `action`s on this single tool, sharing one action schema and result
+  envelope across MCP clients and the admin CLI. Backend tools named
+  `mcp.wrapper` are rejected by collision policy and cannot overwrite the
+  wrapper descriptor.
+- **Daemon broker active-call safety** — the broker tracks a broker-global
+  active backend-call counter; daemon `stop` and non-force `restart` (via
+  `mcp.wrapper`, legacy wrapper-control methods, or CLI) are rejected while any
+  shared-backend call is in flight.
+- **`BackendSlot::live()`** owner query and active-call rejection predicates
+  (`restart_blocked_by_active_calls`, `stop_blocked_by_active_calls`).
+- Collision-preservation regression proof: the wrapper descriptor always wins a
+  reserved-name collision.
+
+### Changed
+
+- **Owner reshape** — wrapper tool logic reshaped to owner-local methods.
+  `BackendSlot` owns the lifecycle decision; callers reach live state through
+  owner APIs instead of locking the raw backend handle. Tool validation is
+  internalized into `ToolAction::validate_params` and
+  `ToolInvocation::from_arguments`; the dispatch layer holds no validation
+  rules. `tools` is the external entry / microkernel projection, not a
+  lifecycle owner.
+- **Cache as hold-state** — `mcp_manager::Cache` owns the external `tools/list`
+  / `initialize` views as derived hold-state, rebuilt on load/refresh, so
+  `lookup` is a pure read. The backend discovery fingerprint (`discovery_hash`)
+  is computed from raw backend responses only and is never polluted by the
+  wrapper-merged view.
+- **Docs role split** — `CLAUDE.md` trimmed to act rules + navigation;
+  architecture truth (owner map, backend lifecycle, concurrency, planes, tools
+  projection) lives in `docs/handbook/`.
+
+### Behaviour
+
+- No external contract change from the reshape: envelope shapes, error codes,
+  JSON-RPC error codes, the `tools/list` union, and admin CLI output are
+  unchanged. Verified by the full test suite plus daemon and real-server smoke.
+
+### Next
+
+- **Bidirectional communication** is the next development direction: deepening
+  the server-to-client request/notification bridge so wrapped servers can drive
+  richer two-way MCP interactions through the stable wrapper transport.
+
 ## [0.4.2] - 2026-03-28
 
 ### Fixed

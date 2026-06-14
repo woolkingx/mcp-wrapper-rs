@@ -349,6 +349,27 @@ impl BackendSlot {
         self.backend.clone()
     }
 
+    /// Return the current backend only if it exists and is alive.
+    /// Owner query: the slot owns the alive decision and the lock; callers must
+    /// not reach into `handle()` to make this decision themselves.
+    pub async fn live(&self) -> Option<Arc<Backend>> {
+        let guard = self.backend.lock().await;
+        guard.as_ref().filter(|be| be.is_alive()).cloned()
+    }
+
+    /// Lifecycle invariant: non-force restart is rejected while the
+    /// caller-owned active-call count is non-zero. The counter is owned by the
+    /// caller (runtime/broker); the rule is owned here.
+    pub fn restart_blocked_by_active_calls(active: usize, force: bool) -> bool {
+        active > 0 && !force
+    }
+
+    /// Lifecycle invariant: stop is rejected while the caller-owned active-call
+    /// count is non-zero.
+    pub fn stop_blocked_by_active_calls(active: usize) -> bool {
+        active > 0
+    }
+
     /// Ensure a live initialized backend exists.
     ///
     /// Returns `true` when this call replaced a previously known backend and

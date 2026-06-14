@@ -1,6 +1,6 @@
 # mcp-wrapper-rs
 
-A lightweight, universal MCP (Model Context Protocol) wrapper written in Rust. Reduces memory footprint from ~100MB per MCP server to ~2MB by caching protocol responses and spawning subprocesses only when needed.
+A stable MCP supervisor proxy written in Rust. It turns stdio MCP servers into controllable, observable backends by caching stable discovery data, exposing lifecycle control through the unified `mcp.wrapper` tool, and starting or reusing backend subprocesses only when dynamic calls need them.
 
 [中文文檔](README-zh.md)
 
@@ -19,20 +19,84 @@ Total                       ~370MB (idle!)
 
 ## The Solution
 
-`mcp-wrapper-rs` acts as a transparent proxy:
+`mcp-wrapper-rs` acts as a stable supervisor proxy:
 
 ```
-┌─────────────┐      ┌─────────────────┐      ┌─────────────┐
-│ Claude Code │ ──── │ mcp-wrapper-rs  │ ──── │ MCP Server  │
-│             │      │    (~2MB)       │      │ (on-demand) │
-└─────────────┘      └─────────────────┘      └─────────────┘
+┌─────────────┐      ┌──────────────────────┐      ┌─────────────┐
+│ Claude Code │ ──── │ mcp-wrapper-rs       │ ──── │ MCP Server  │
+│             │      │ cache + mcp.wrapper  │      │ (on-demand) │
+└─────────────┘      └──────────────────────┘      └─────────────┘
 ```
 
-- **Startup**: Spawns subprocess once to cache `tools/list`, `prompts/list`, `resources/list`
-- **Runtime**: Responds instantly from cache for protocol queries
-- **Tool calls**: Maintains a persistent subprocess connection; reuses it across calls (auto-respawns on failure)
+- **Startup**: Spawns the backend once to cache stable discovery data and exposes wrapper-owned tools capability
+- **Runtime**: Serves `initialize` and list requests from cache, including the wrapper-owned `mcp.wrapper` tool
+- **Wrapper control**: Handles `mcp.wrapper` actions locally for backend status, ping, refresh, restart, and stop
+- **Backend calls**: Keeps dynamic MCP work owned by the backend subprocess, reusing or respawning it as needed
 
 Result: **4 MCP servers using only ~8MB total** (vs ~370MB before)
+
+## Core Concepts
+
+`mcp-wrapper-rs` is a **supervisor proxy**: a stable MCP server the client
+connects to, behind which real MCP servers are managed children. The client
+talks to one transport that never dies; backend processes start, restart, and
+stop without ever breaking that connection.
+
+Four ideas define the product:
+
+- **Cache-first idle economy.** Stable discovery data (`initialize`,
+  `tools/list`, `prompts/list`, `resources/list`) is captured once and served
+  from memory. Backends are spawned lazily — only when a dynamic call
+  (`tools/call`, `resources/read`, …) actually needs them — so an idle wrapper
+  costs almost nothing. The externally served `tools/list` / `initialize` views
+  are **hold-state**: rebuilt only when backend data loads or refreshes, never
+  recomputed per request.
+
+- **One unified control surface: `mcp.wrapper`.** The wrapper injects exactly
+  one reserved tool, `mcp.wrapper`, into `tools/list`. Backend status, ping,
+  discovery refresh, restart, and stop are all `action`s on this single tool.
+  The admin CLI and MCP clients project into the *same* action schema and
+  result envelope — there is no second control path. A backend that tries to
+  register the reserved name cannot overwrite it.
+
+- **Owner-local lifecycle.** Each piece of state has exactly one owner.
+  `BackendSlot` owns the backend process — its alive decision, restart/stop
+  transitions, and the active-call safety invariant (stop and non-force restart
+  are rejected while calls are in flight). `Cache` owns discovery data and the
+  external view lifetime. `tools` is the external entry and dispatch layer; it
+  owns the action schema and envelope but holds **no** lifecycle state — it
+  routes actions to owner methods. Validation lives on the invocation objects
+  themselves, not in a separate validator.
+
+- **Observe → hook → readback control plane.** Backend facts (process exit,
+  `listChanged`, degraded cooldown) are signals, not truth. A control action
+  requests a legal transition through the owner; the new state is proven by a
+  readback snapshot before any client, log, CLI, or tool projection reports it.
+  Status is evidence, not a hope attached to a command.
+
+In **daemon mode**, one broker owns a single shared backend/cache pair and
+fans out to many client sessions; the active-call safety counter is
+broker-global, so no session can stop or restart the shared backend while
+another session has work in flight.
+
+### What it fills in over plain stdio MCP
+
+Plain stdio MCP leaves real gaps. This wrapper closes them behind one stable
+transport:
+
+| Gap in plain stdio MCP | What mcp-wrapper-rs adds |
+|---|---|
+| Client cannot control the server it is connected to | `mcp.wrapper` lifecycle actions: `restart` / `stop` / `refresh` / `status` / `ping`, with the transport staying alive across restarts |
+| No standard backend-state readback | `observe → hook → readback` control plane: snapshot, generation, cache epoch, discovery hash as proven evidence |
+| Idle servers keep consuming memory | Cache-first stable discovery layer + lazy backend spawn |
+| Every client spawns its own server | Daemon broker shares one backend/cache pair across sessions |
+
+**Next direction:** a deeper **bidirectional communication** bridge, so wrapped
+servers can drive richer two-way (server-to-client) MCP interactions through the
+stable wrapper transport.
+
+Full architecture, owner map, flow projections, and proof gates live in the
+[handbook](docs/handbook/index.html).
 
 ## Installation
 
@@ -110,7 +174,7 @@ Coordination uses flock + PID file + Unix domain socket under `$XDG_RUNTIME_DIR/
 
 ### Admin CLI
 
-The admin CLI is a readback/control projection over the same daemon, broker, backend, and MCP cache owners used at runtime. It does not manage backend processes through a second code path.
+The admin CLI is a projection over the same `mcp.wrapper` action schema, daemon, broker, backend, and MCP cache owners used at runtime. It does not manage backend processes through a second code path.
 
 ```bash
 # Read broker/backend status for a command identity
@@ -166,7 +230,8 @@ Edit `~/.claude.json`:
 2. **Runtime Phase**
    - `initialize` → Instant response from cache
    - `tools/list`, `prompts/list`, `resources/list` → Instant response from cache
-   - `tools/call`, `resources/read`, `prompts/get` → Forwarded to persistent backend subprocess
+   - `tools/call` with `mcp.wrapper` → Local wrapper control/readback through `src/tools`
+   - Other `tools/call`, `resources/read`, `prompts/get` → Forwarded to persistent backend subprocess
    - Notifications relayed bidirectionally between client and backend
 
 3. **Resource Management**
@@ -213,12 +278,13 @@ After deploying mcp-wrapper-rs with 8 MCP servers in production:
 **Runtime Performance**
 - CPU load: **Reduced by ~40%** (no idle MCP processes)
 - Response latency: Protocol queries return instantly from cache
-- Only active during tool execution (subprocess spawns on-demand)
+- Static protocol requests stay in the wrapper cache; backend lifecycle starts only after dynamic MCP work is requested
 
 **Why It's Faster**
-- **On-demand subprocess spawning**: Processes only run when needed, eliminated idle overhead
+- **Lazy backend lifecycle**: Backend processes only run when needed, eliminating idle overhead
 - **Cache-first design**: `initialize`, `tools/list`, `prompts/list`, `resources/list` served from memory
-- **Clean resource lifecycle**: Subprocess killed immediately after tool execution completes
+- **Unified control surface**: CLI and MCP clients use the same wrapper action boundary for lifecycle readback and control
+- **Clean resource lifecycle**: Backend process groups are cleaned up when the wrapper stops or explicitly stops the backend
 
 ## Compatibility
 
@@ -245,4 +311,4 @@ MIT License - see [LICENSE](LICENSE)
 
 ## Contributing
 
-Contributions welcome! Please read the architecture doc first to understand the design decisions.
+Contributions welcome. Please read the handbook first to understand the current owner boundaries and proof gates.

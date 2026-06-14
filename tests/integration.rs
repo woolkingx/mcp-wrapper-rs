@@ -3,7 +3,7 @@
 //!
 //! Uses the echo_server.py fixture as the backend MCP server.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
@@ -177,9 +177,37 @@ fn run_admin_json(prefix: &[&str], target: &[String]) -> Value {
     })
 }
 
+fn run_admin_json_any(prefix: &[&str], target: &[String]) -> (bool, Value, String) {
+    let out = run_cli(&admin_args(prefix, target));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "bad admin JSON: {e}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            stderr
+        )
+    });
+    (out.status.success(), value, stderr)
+}
+
 fn stop_admin_broker(target: &[String]) {
     let _ = run_cli(&admin_args(&["broker", "stop", "--json"], target));
     std::thread::sleep(Duration::from_millis(150));
+}
+
+fn wrapper_envelope(resp: &Value) -> &Value {
+    &resp["result"]["_meta"]["mcpWrapper"]
+}
+
+fn sleep_call_target(suffix: &str, unique_arg: &str) -> Vec<String> {
+    vec![
+        "python3".to_string(),
+        echo_server_path().to_string_lossy().to_string(),
+        unique_arg.to_string(),
+        "--sleep-call".to_string(),
+        "1.0".to_string(),
+        format!("--{}", suffix),
+    ]
 }
 
 // ── CLI tests ────────────────────────────────────────────────────────────────
@@ -381,8 +409,9 @@ fn basic_flow() {
     let tools = tools_resp["result"]["tools"]
         .as_array()
         .expect("tools array");
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0]["name"], "echo");
+    assert_eq!(tools.len(), 2);
+    assert!(tools.iter().any(|tool| tool["name"] == "echo"));
+    assert!(tools.iter().any(|tool| tool["name"] == "mcp.wrapper"));
 
     // 3. tools/call echo
     w.send(&json!({
@@ -392,6 +421,83 @@ fn basic_flow() {
     let call_resp = w.recv();
     assert_eq!(call_resp["result"]["content"][0]["type"], "text");
     assert_eq!(call_resp["result"]["content"][0]["text"], "hello world");
+
+    w.kill();
+}
+
+#[test]
+fn wrapper_tool_status_is_injected_and_local() {
+    let mut w = Wrapper::spawn(&["--init-timeout", "10"]);
+    w.handshake();
+
+    w.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}));
+    let tools_resp = w.recv();
+    let tools = tools_resp["result"]["tools"].as_array().unwrap();
+    let wrapper_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "mcp.wrapper")
+        .expect("mcp.wrapper tool");
+    assert_eq!(wrapper_tool["inputSchema"]["required"][0], "action");
+
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "mcp.wrapper",
+            "arguments": {
+                "action": "backend.status"
+            }
+        }
+    }));
+    let status = w.recv();
+    let envelope = wrapper_envelope(&status);
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["action"], "backend.status");
+    assert_eq!(envelope["target"], "default");
+    assert_eq!(envelope["result"]["backend"]["state"], "cold");
+    assert_eq!(envelope["result"]["backend"]["alive"], false);
+    assert_eq!(status["result"]["isError"], false);
+
+    w.kill();
+}
+
+#[test]
+fn wrapper_tool_restart_keeps_transport_alive() {
+    let mut w = Wrapper::spawn(&["--init-timeout", "10"]);
+    w.handshake();
+
+    w.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"msg": "before-restart"}}
+    }));
+    let before = w.recv();
+    assert_eq!(before["result"]["content"][0]["text"], "before-restart");
+
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "mcp.wrapper",
+            "arguments": {
+                "action": "backend.restart",
+                "params": {"force": true}
+            }
+        }
+    }));
+    let restart = w.recv();
+    let envelope = wrapper_envelope(&restart);
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["action"], "backend.restart");
+    assert!(envelope["result"]["newCacheEpoch"].as_u64().unwrap() >= 1);
+
+    w.send(&json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"msg": "after-restart"}}
+    }));
+    let after = w.recv();
+    assert_eq!(after["result"]["content"][0]["text"], "after-restart");
 
     w.kill();
 }
@@ -517,7 +623,12 @@ fn daemon_basic_flow() {
     // tools/list from broker cache
     w1.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}));
     let tools = w1.recv();
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 2);
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "mcp.wrapper"));
 
     // tools/call through broker
     w1.send(&json!({
@@ -531,6 +642,88 @@ fn daemon_basic_flow() {
 
     // Wait a moment then clean up broker socket
     std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+#[test]
+fn daemon_wrapper_tool_restart_rejects_active_call() {
+    let unique_arg = format!("--daemon-wrapper-restart-active-{}", std::process::id());
+    let target = sleep_call_target("target", &unique_arg);
+    stop_admin_broker(&target);
+    let backend_args = [unique_arg.as_str(), "--sleep-call", "1.0", "--target"];
+
+    let mut w1 =
+        Wrapper::spawn_with_backend_args(&["--daemon", "--init-timeout", "10"], &backend_args);
+    w1.handshake();
+    let mut w2 =
+        Wrapper::spawn_with_backend_args(&["--daemon", "--init-timeout", "10"], &backend_args);
+    w2.handshake();
+
+    w1.send(&json!({
+        "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"msg": "slow-restart"}}
+    }));
+    std::thread::sleep(Duration::from_millis(150));
+
+    w2.send(&json!({
+        "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+        "params": {
+            "name": "mcp.wrapper",
+            "arguments": {"action": "backend.restart"}
+        }
+    }));
+    let rejected = w2.recv();
+    let envelope = wrapper_envelope(&rejected);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "activeCalls");
+    assert_eq!(rejected["result"]["isError"], true);
+
+    let delayed = w1.recv();
+    assert_eq!(delayed["result"]["content"][0]["text"], "slow-restart");
+
+    w1.kill();
+    w2.kill();
+    stop_admin_broker(&target);
+}
+
+#[test]
+fn daemon_wrapper_tool_stop_rejects_active_call() {
+    let unique_arg = format!("--daemon-wrapper-stop-active-{}", std::process::id());
+    let target = sleep_call_target("target", &unique_arg);
+    stop_admin_broker(&target);
+    let backend_args = [unique_arg.as_str(), "--sleep-call", "1.0", "--target"];
+
+    let mut w1 =
+        Wrapper::spawn_with_backend_args(&["--daemon", "--init-timeout", "10"], &backend_args);
+    w1.handshake();
+    let mut w2 =
+        Wrapper::spawn_with_backend_args(&["--daemon", "--init-timeout", "10"], &backend_args);
+    w2.handshake();
+
+    w1.send(&json!({
+        "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"msg": "slow-stop"}}
+    }));
+    std::thread::sleep(Duration::from_millis(150));
+
+    w2.send(&json!({
+        "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+        "params": {
+            "name": "mcp.wrapper",
+            "arguments": {"action": "backend.stop"}
+        }
+    }));
+    let rejected = w2.recv();
+    let envelope = wrapper_envelope(&rejected);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "activeCalls");
+    assert_eq!(rejected["result"]["isError"], true);
+
+    let delayed = w1.recv();
+    assert_eq!(delayed["result"]["content"][0]["text"], "slow-stop");
+
+    w1.kill();
+    w2.kill();
+    stop_admin_broker(&target);
 }
 
 #[test]
@@ -563,6 +756,104 @@ fn daemon_two_clients_share_broker() {
     w2.kill();
 
     std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+#[test]
+fn daemon_legacy_restart_rejects_active_call() {
+    let unique_arg = format!("--daemon-legacy-restart-active-{}", std::process::id());
+    let target = sleep_call_target("target", &unique_arg);
+    stop_admin_broker(&target);
+    let backend_args = [unique_arg.as_str(), "--sleep-call", "1.0", "--target"];
+
+    let mut w1 =
+        Wrapper::spawn_with_backend_args(&["--daemon", "--init-timeout", "10"], &backend_args);
+    w1.handshake();
+    let mut w2 =
+        Wrapper::spawn_with_backend_args(&["--daemon", "--init-timeout", "10"], &backend_args);
+    w2.handshake();
+
+    w1.send(&json!({
+        "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"msg": "slow-legacy"}}
+    }));
+    std::thread::sleep(Duration::from_millis(150));
+
+    w2.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "mcp-wrapper/backend/restart",
+        "params": {}
+    }));
+    let rejected = w2.recv();
+    assert_eq!(rejected["error"]["code"], -32603);
+    assert_eq!(
+        rejected["error"]["message"],
+        "backend restart rejected while calls are active"
+    );
+
+    let delayed = w1.recv();
+    assert_eq!(delayed["result"]["content"][0]["text"], "slow-legacy");
+
+    w1.kill();
+    w2.kill();
+    stop_admin_broker(&target);
+}
+
+#[test]
+fn cli_admin_backend_stop_rejects_active_daemon_call() {
+    let unique_arg = format!("--cli-stop-active-{}", std::process::id());
+    let target = sleep_call_target("target", &unique_arg);
+    stop_admin_broker(&target);
+    let backend_args = [unique_arg.as_str(), "--sleep-call", "1.0", "--target"];
+
+    let mut w =
+        Wrapper::spawn_with_backend_args(&["--daemon", "--init-timeout", "10"], &backend_args);
+    w.handshake();
+    w.send(&json!({
+        "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"msg": "slow-cli-stop"}}
+    }));
+    std::thread::sleep(Duration::from_millis(150));
+
+    let (success, stopped, _stderr) = run_admin_json_any(&["backend", "stop", "--json"], &target);
+    assert!(!success);
+    assert_eq!(stopped["ok"], false);
+    assert_eq!(stopped["error"]["code"], "activeCalls");
+
+    let delayed = w.recv();
+    assert_eq!(delayed["result"]["content"][0]["text"], "slow-cli-stop");
+
+    w.kill();
+    stop_admin_broker(&target);
+}
+
+#[test]
+fn cli_admin_backend_restart_rejects_active_daemon_call() {
+    let unique_arg = format!("--cli-restart-active-{}", std::process::id());
+    let target = sleep_call_target("target", &unique_arg);
+    stop_admin_broker(&target);
+    let backend_args = [unique_arg.as_str(), "--sleep-call", "1.0", "--target"];
+
+    let mut w =
+        Wrapper::spawn_with_backend_args(&["--daemon", "--init-timeout", "10"], &backend_args);
+    w.handshake();
+    w.send(&json!({
+        "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"msg": "slow-cli-restart"}}
+    }));
+    std::thread::sleep(Duration::from_millis(150));
+
+    let (success, restarted, _stderr) =
+        run_admin_json_any(&["backend", "restart", "--json"], &target);
+    assert!(!success);
+    assert_eq!(restarted["ok"], false);
+    assert_eq!(restarted["error"]["code"], "activeCalls");
+
+    let delayed = w.recv();
+    assert_eq!(delayed["result"]["content"][0]["text"], "slow-cli-restart");
+
+    w.kill();
+    stop_admin_broker(&target);
 }
 
 #[test]

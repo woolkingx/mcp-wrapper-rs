@@ -24,6 +24,7 @@ mod mcp_interface;
 mod mcp_interface_tests;
 mod mcp_manager;
 mod runtime_manager;
+mod tools;
 
 use cli::CliMode;
 use std::env;

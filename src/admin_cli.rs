@@ -3,6 +3,7 @@ use tokio::io::BufReader;
 
 use crate::cli::{AdminAction, AdminArgs, CommandTarget};
 use crate::{daemon_manager, logging, mcp_interface};
+use crate::tools::wrapper::WRAPPER_TOOL_NAME;
 
 pub async fn run(args: AdminArgs) -> i32 {
     let action = args.action.name();
@@ -150,12 +151,10 @@ async fn status(
     let broker = daemon_manager::broker_status(&paths);
 
     let result = match stream {
-        Ok(stream) => {
-            match call_backend_control(stream, "mcp-wrapper/backend/status", None).await {
-                Ok(resp) => resp.get("result").cloned().unwrap_or(Value::Null),
-                Err(e) => json!({ "backendError": e }),
-            }
-        }
+        Ok(stream) => match call_wrapper_tool(stream, "backend.status", None).await {
+            Ok(envelope) => envelope.get("result").cloned().unwrap_or(Value::Null),
+            Err(e) => json!({ "backendError": e }),
+        },
         Err(_) => Value::Null,
     };
 
@@ -174,10 +173,10 @@ async fn doctor(action: &str, target: &CommandTarget) -> Value {
     let broker = daemon_manager::broker_status(&paths);
     let backend_ping = if broker.running {
         match daemon_manager::connect_existing_broker(&paths).await {
-            Ok(stream) => call_backend_control(stream, "mcp-wrapper/backend/ping", None)
+            Ok(stream) => call_wrapper_tool(stream, "backend.ping", None)
                 .await
                 .ok()
-                .and_then(|resp| resp.get("result").cloned()),
+                .and_then(|envelope| envelope.get("result").cloned()),
             Err(_) => None,
         }
     } else {
@@ -227,12 +226,12 @@ async fn backend_control(args: &AdminArgs) -> Value {
         }
     };
 
-    let method = match args.action {
-        AdminAction::BackendStatus => "mcp-wrapper/backend/status",
-        AdminAction::BackendPing => "mcp-wrapper/backend/ping",
-        AdminAction::BackendRefresh => "mcp-wrapper/backend/refresh",
-        AdminAction::BackendRestart => "mcp-wrapper/backend/restart",
-        AdminAction::BackendStop => "mcp-wrapper/backend/stop",
+    let action_name = match args.action {
+        AdminAction::BackendStatus
+        | AdminAction::BackendPing
+        | AdminAction::BackendRefresh
+        | AdminAction::BackendRestart
+        | AdminAction::BackendStop => args.action.name(),
         _ => unreachable!("backend_control called for non-backend action"),
     };
     let params = if args.force {
@@ -241,26 +240,26 @@ async fn backend_control(args: &AdminArgs) -> Value {
         None
     };
 
-    match call_backend_control(stream, method, params).await {
-        Ok(resp) => {
+    match call_wrapper_tool(stream, action_name, params).await {
+        Ok(wrapper) => {
             let broker = daemon_manager::broker_status(&paths);
-            if let Some(err) = resp.get("error").cloned() {
+            if wrapper.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                envelope(
+                    true,
+                    action,
+                    Some(target),
+                    Some(broker_value(&broker)),
+                    wrapper.get("result").cloned(),
+                    None,
+                )
+            } else {
                 envelope(
                     false,
                     action,
                     Some(target),
                     Some(broker_value(&broker)),
                     None,
-                    Some(err),
-                )
-            } else {
-                envelope(
-                    true,
-                    action,
-                    Some(target),
-                    Some(broker_value(&broker)),
-                    resp.get("result").cloned(),
-                    None,
+                    wrapper.get("error").cloned(),
                 )
             }
         }
@@ -275,20 +274,42 @@ async fn backend_control(args: &AdminArgs) -> Value {
     }
 }
 
-async fn call_backend_control(
+async fn call_wrapper_tool(
     stream: tokio::net::UnixStream,
-    method: &str,
+    action: &str,
     params: Option<Value>,
 ) -> Result<Value, String> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let req = mcp_interface::build_request(json!(1), method, params);
+    let mut arguments = json!({
+        "action": action,
+        "target": "default"
+    });
+    if let Some(params) = params {
+        arguments["params"] = params;
+    }
+    let req = mcp_interface::build_request(
+        json!(1),
+        "tools/call",
+        Some(json!({
+            "name": WRAPPER_TOOL_NAME,
+            "arguments": arguments
+        })),
+    );
     mcp_interface::write_message(&mut writer, &req)
         .await
         .map_err(|e| format!("write broker request: {}", e))?;
-    mcp_interface::read_message(&mut reader)
+    let resp = mcp_interface::read_message(&mut reader)
         .await
-        .ok_or_else(|| "broker closed without response".to_string())
+        .ok_or_else(|| "broker closed without response".to_string())?;
+    if let Some(err) = resp.get("error") {
+        return Err(err.to_string());
+    }
+    resp.get("result")
+        .and_then(|v| v.get("_meta"))
+        .and_then(|v| v.get("mcpWrapper"))
+        .cloned()
+        .ok_or_else(|| "broker response missing mcpWrapper envelope".to_string())
 }
 
 fn envelope(

@@ -9,6 +9,8 @@
     <tr><th>Decision</th><th>Rule owner</th><th>Result</th></tr>
     <tr><td>Method route</td><td><a href="../../src/mcp_interface.rs">mcp_interface.rs</a></td><td>Cache, local ping, wrapper control, or pass-through.</td></tr>
     <tr><td>Capability support</td><td><a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td>Query supported list method or cache empty result.</td></tr>
+    <tr><td><code>mcp.wrapper</code> action route</td><td><a href="../../src/tools/mod.rs">src/tools</a></td><td>Validate action, target, and params; call a tools object method through the current runtime or broker context.</td></tr>
+    <tr><td>Multi-backend tool route</td><td>future supervisor registry owner</td><td>Resolve tool name from a rebuilt route table; return structured stale or ambiguous route error instead of guessing at call time.</td></tr>
     <tr><td>Backend readiness</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td>Reuse, respawn, refresh cache, or return JSON-RPC error.</td></tr>
     <tr><td>Backend hook/observe control</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a> and <a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td>Observe state, restart or refresh through local hooks, increment generation/cache epoch, then publish readback evidence.</td></tr>
     <tr><td>Backend spawn storm</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td>After repeated spawn failures, enter degraded cooldown; only forced restart may bypass the cooldown.</td></tr>
@@ -18,6 +20,6 @@
 </section>
 <section>
   <h2>Invariants</h2>
-  <p>Route decisions stay pure. Backend request IDs are internal and must be restored before the client sees the response. Process groups are killed explicitly before runtime exit. Hook/observe control must not treat arbitrary notifications as lifecycle truth. Peer responses must be forwarded without holding the backend slot mutex that protects lifecycle state. Spawn failures must become observable degraded state instead of repeated blind respawn attempts.</p>
+  <p>Route decisions stay pure. Backend request IDs are internal and must be restored before the client sees the response. Process groups are killed explicitly before runtime exit. <code>mcp.wrapper</code> actions must not pass through to backend tools and must not mutate lifecycle or cache state except by calling the existing owner APIs. Future multi-backend routing must use a registry-owned route table; string guessing at call time is illegal. Hook/observe control must not treat arbitrary notifications as lifecycle truth. Peer responses must be forwarded without holding the backend slot mutex that protects lifecycle state. Spawn failures must become observable degraded state instead of repeated blind respawn attempts.</p>
 </section>
 </main></body></html>

@@ -31,8 +31,8 @@
 <body>
   <header>
     <h1>mcp-wrapper-rs Handbook</h1>
-    <p>A system atlas for the Rust MCP stdio wrapper: protocol boundary, cache policy, backend lifecycle, daemon broker topology, and proof gates.</p>
-    <p><span class="tag">raw JSON-RPC</span><span class="tag">cache-first proxy</span><span class="tag">process-group cleanup</span><span class="tag">daemon broker</span></p>
+    <p>A system atlas for the Rust MCP stdio supervisor proxy: protocol boundary, cache policy, unified <code>mcp.wrapper</code> tools surface, backend lifecycle, daemon broker topology, and proof gates.</p>
+    <p><span class="tag">raw JSON-RPC</span><span class="tag">supervisor proxy</span><span class="tag">mcp.wrapper</span><span class="tag">daemon broker</span></p>
   </header>
   <main>
     <nav aria-label="Handbook navigation">
@@ -66,7 +66,14 @@
         <a href="../../README-zh.md">Chinese README</a>
         <a href="../../ARCHITECTURE.md">Legacy architecture note</a>
         <a href="../../CHANGELOG.md">Changelog</a>
+        <a href="../../CLAUDE.md">Agent act rules</a>
         <a href="../../LICENSE">License</a>
+        <a href="../plan/2026-05-28-handbook-bootstrap.md">Plan: handbook bootstrap</a>
+        <a href="../plan/2026-05-28-data-owner-refactor.md">Plan: data owner refactor</a>
+        <a href="../plan/2026-05-28-backend-hook-observe.md">Plan: backend hook and observe</a>
+        <a href="../plan/2026-05-28-primary-mcp-data-code-alignment.md">Plan: primary MCP data code alignment</a>
+        <a href="../plan/2026-05-28-review-runtime-fixes.md">Plan: review runtime fixes</a>
+        <a href="../plan/2026-05-28-admin-cli-owner-projection.md">Plan: admin CLI owner projection</a>
       </details>
       <details>
         <summary>Runtime Owners</summary>
@@ -76,6 +83,7 @@
         <a href="../../src/runtime_manager.rs">runtime_manager.rs</a>
         <a href="../../src/daemon_manager.rs">daemon_manager.rs</a>
         <a href="../../src/broker_manager.rs">broker_manager.rs</a>
+        <a href="../../src/tools/mod.rs">tools</a>
         <a href="../../src/logging.rs">logging.rs</a>
         <a href="../../src/main.rs">main.rs</a>
       </details>
@@ -90,21 +98,21 @@
     <div>
       <section id="summary">
         <h2>Project Summary</h2>
-        <p><code>mcp-wrapper-rs</code> wraps stdio MCP servers with a lightweight Rust proxy. It answers stable MCP discovery requests from cache and forwards dynamic calls to a child MCP server only when needed. Normal mode gives each wrapper its own lazy backend; daemon mode lets multiple wrapper sessions share one broker and one backend.</p>
-        <div class="flow">client stdio -> mcp_interface -> runtime_manager -> mcp_manager | backend_manager -> child MCP server
-daemon client stdio -> daemon_manager -> broker_manager -> mcp_manager | backend_manager</div>
+        <p><code>mcp-wrapper-rs</code> wraps stdio MCP servers with a lightweight Rust supervisor proxy. It answers stable MCP discovery requests from cache, exposes wrapper management through the unified <code>mcp.wrapper</code> tool, and forwards backend-owned dynamic calls to a child MCP server only when needed. Normal mode gives each wrapper its own lazy backend; daemon mode lets multiple wrapper sessions share one broker and one backend.</p>
+        <div class="flow">client stdio -> mcp_interface -> runtime_manager -> mcp_manager | tools | backend_manager -> child MCP server
+daemon client stdio -> daemon_manager -> broker_manager -> mcp_manager | tools | backend_manager</div>
       </section>
       <section id="reader-contract">
         <h2>Reader Contract</h2>
-        <p>Use <a href="../../README.md">README.md</a> for install and usage. Use this handbook for architecture truth, owner boundaries, data/state/control flow, and gates. Local agent act rules and execution plans are not part of the public release surface. Use tests and scripts only as proof surfaces, not as architecture sources.</p>
+        <p>Use <a href="../../README.md">README.md</a> for install and usage. Use this handbook for architecture truth, owner boundaries, data/state/control flow, and gates. Use <a href="../../CLAUDE.md">CLAUDE.md</a> for local agent execution rules. Use tests and scripts only as proof surfaces, not as architecture sources.</p>
       </section>
       <section id="source-map">
         <h2>Source Of Truth Map</h2>
         <table>
           <tr><th>Concern</th><th>Owner</th><th>Evidence</th></tr>
           <tr><td>Product promise and usage</td><td><a href="../../README.md">README.md</a></td><td>Install, CLI flags, examples</td></tr>
-          <tr><td>Architecture and boundary truth</td><td><a href="architecture.html">docs/handbook/architecture.html</a></td><td>stdio scope, data owners, planes, hook/observe control, admin projection</td></tr>
-          <tr><td>Runtime rules for agents</td><td>Local act rules</td><td>Critical rules and release checklist stay outside the public release surface.</td></tr>
+          <tr><td>Architecture and boundary truth</td><td><a href="architecture.html">docs/handbook/architecture.html</a></td><td>stdio scope, data owners, planes, <code>mcp.wrapper</code> tool projection, hook/observe control, admin projection</td></tr>
+          <tr><td>Runtime rules for agents</td><td><a href="../../CLAUDE.md">CLAUDE.md</a></td><td>Critical rules and release checklist</td></tr>
           <tr><td>Protocol routing</td><td><a href="../../src/mcp_interface.rs">src/mcp_interface.rs</a></td><td><code>route()</code> and MCP data key tests</td></tr>
           <tr><td>Proof</td><td><a href="../../tests/integration.rs">tests/</a> and <a href="../../scripts/test-all.sh">scripts/</a></td><td>Conformance, integration, smoke checks</td></tr>
         </table>
@@ -113,14 +121,14 @@ daemon client stdio -> daemon_manager -> broker_manager -> mcp_manager | backend
         <h2>Chapter Map</h2>
         <table>
           <tr><th>Chapter</th><th>Question</th><th>Primary owner</th></tr>
-          <tr><td><a href="doctrine.html">Doctrine</a></td><td>What principle keeps the wrapper simple?</td><td>Cache what is static, proxy what is dynamic.</td></tr>
-          <tr><td><a href="architecture.html">Architecture</a></td><td>How is the product structured?</td><td>stdio wrapper scope, JSON-RPC and MCP data owners, hook/observe control plane, CLI admin projection.</td></tr>
+          <tr><td><a href="doctrine.html">Doctrine</a></td><td>What principle keeps the wrapper simple?</td><td>Cache static discovery, proxy backend-owned dynamics, expose wrapper lifecycle through <code>mcp.wrapper</code>.</td></tr>
+          <tr><td><a href="architecture.html">Architecture</a></td><td>How is the product structured?</td><td>stdio wrapper scope, JSON-RPC and MCP data owners, unified tools window, hook/observe control plane, CLI admin projection.</td></tr>
           <tr><td><a href="data.html">Data</a></td><td>What exists at runtime?</td><td>Primary JSON-RPC envelopes, MCP tool/resource/prompt data, and supporting backend/cache/daemon state.</td></tr>
           <tr><td><a href="schema.html">Schema</a></td><td>What shape is legal?</td><td>JSON-RPC 2.0, MCP envelopes, wrapper hook responses, backend snapshots.</td></tr>
           <tr><td><a href="topology.html">Topology</a></td><td>Which crossings are allowed?</td><td>Owner modules, backend process boundary, hook/observe boundary, daemon broker.</td></tr>
           <tr><td><a href="flow.html">Flow</a></td><td>How does state move?</td><td>Init cache, pass-through ID remap, observe-state-hook-readback evidence.</td></tr>
           <tr><td><a href="logic.html">Logic</a></td><td>What transition may happen?</td><td>Route decision, capability filtering, generation state, cache epoch, lifecycle hooks.</td></tr>
-          <tr><td><a href="executor.html">Executor</a></td><td>Who executes only?</td><td>mcp_interface, mcp_manager, backend_manager, runtime, daemon, broker managers.</td></tr>
+          <tr><td><a href="executor.html">Executor</a></td><td>Who executes only?</td><td>mcp_interface, mcp_manager, tools, backend_manager, runtime, daemon, broker managers.</td></tr>
           <tr><td><a href="proof.html">Proof</a></td><td>What proves it?</td><td>Cargo tests, smoke scripts, live server checks.</td></tr>
           <tr><td><a href="workflow.html">Workflow</a></td><td>How should maintainers act?</td><td>Docs-first changes with release gates.</td></tr>
         </table>
@@ -134,9 +142,11 @@ daemon client stdio -> daemon_manager -> broker_manager -> mcp_manager | backend
           <tr><td><code>GATE-PROXY-01</code></td><td>Pass-through calls remap IDs, reuse a live backend, and clean process groups on exit.</td><td><a href="../../tests/integration.rs">integration tests</a>, <a href="../../tests/check_orphans.py">orphan check</a></td></tr>
           <tr><td><code>GATE-BIDI-01</code></td><td>Server-initiated MCP requests reach the active client and client responses return to the backend.</td><td><code>cargo test --test integration server_request_roundtrip</code>, <code>cargo test --test integration daemon_server_request_roundtrip</code></td></tr>
           <tr><td><code>GATE-DAEMON-01</code></td><td>Daemon mode multiplexes clients through one broker-owned backend.</td><td><a href="../../scripts/test-daemon.sh">daemon smoke</a>, <a href="../../tests/integration.rs">daemon integration tests</a></td></tr>
-          <tr><td><code>GATE-BACKEND-OBS-01</code></td><td>Backend hook/observe control reports state, refreshes cache by generation, restarts safely, and emits client-visible change evidence only after cache readback.</td><td><a href="../../tests/backend_hooks.rs">backend hook tests</a></td></tr>
-          <tr><td><code>GATE-CLI-01</code></td><td>Admin CLI projects owner readback and control without creating a second backend lifecycle manager.</td><td><a href="../../tests/integration.rs">admin CLI integration tests</a></td></tr>
-          <tr><td><code>GATE-DOCS-01</code></td><td>Public docs stay reachable from this handbook tree.</td><td>handbook link check</td></tr>
+          <tr><td><code>GATE-BACKEND-OBS-01</code></td><td>Backend hook/observe control reports state, refreshes cache by generation, restarts safely, and emits client-visible change evidence only after cache readback.</td><td><a href="../plan/2026-05-28-backend-hook-observe.md">backend hook/observe plan</a></td></tr>
+          <tr><td><code>GATE-TOOLS-01</code></td><td><code>mcp.wrapper</code> is the only wrapper-owned backend-visible tool; it validates action calls, invokes existing owner APIs, and never forwards wrapper control to the backend as a backend tool call.</td><td><a href="../plan/2026-06-14-mcp-supervisor-proxy.md">supervisor proxy plan</a>, <a href="../../tests/integration.rs">integration tests</a></td></tr>
+          <tr><td><code>GATE-DAEMON-TOOLS-01</code></td><td>Daemon broker <code>mcp.wrapper</code>, legacy wrapper-control, and CLI backend stop/non-force restart use broker-owned active-call readback before lifecycle transitions.</td><td><a href="../plan/2026-06-14-broker-daemon-wrapper-hardening.md">broker daemon hardening plan</a>, <a href="../../tests/integration.rs">integration tests</a></td></tr>
+          <tr><td><code>GATE-CLI-01</code></td><td>Admin CLI projects owner readback and control without creating a second backend lifecycle manager.</td><td><a href="../plan/2026-05-28-admin-cli-owner-projection.md">admin CLI plan</a>, <a href="../../tests/integration.rs">admin CLI integration tests</a></td></tr>
+          <tr><td><code>GATE-DOCS-01</code></td><td>Active docs stay reachable from this handbook tree.</td><td><a href="../plan/2026-05-28-handbook-bootstrap.md">bootstrap plan</a></td></tr>
         </table>
       </section>
       <section id="reading-order">

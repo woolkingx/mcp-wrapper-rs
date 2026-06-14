@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 
 use crate::backend_manager::{Backend, BackendEvent, ChildPgids};
 use crate::mcp_interface::{self, McpDataKey};
+use crate::tools;
 
 /// Timeout for individual list/* queries during init.
 /// Separate from --init-timeout, which covers the initialize handshake.
@@ -46,6 +47,13 @@ impl Capabilities {
 }
 
 /// Cached MCP discovery results from the backend MCP server.
+///
+/// `responses` and `server_info` hold pure backend data; `discovery_hash` is
+/// computed from them only, so the backend fingerprint stays clean. The
+/// `*_view` fields are the externally served projections (backend data plus the
+/// reserved `mcp.wrapper` tool / tools capability). They are derived hold-state:
+/// rebuilt by `rebuild_views` whenever backend data is loaded or refreshed, so
+/// `lookup` is a pure read with no per-request merge.
 struct CachedData {
     responses: HashMap<McpDataKey, Value>,
     server_info: Value,
@@ -54,6 +62,22 @@ struct CachedData {
     cache_epoch: u64,
     capabilities_hash: String,
     discovery_hash: String,
+    tools_list_view: Value,
+    initialize_view: Value,
+}
+
+impl CachedData {
+    /// Recompute the externally served views from current backend data. The
+    /// cache owns the lifetime of these views: they include the reserved
+    /// `mcp.wrapper` tool and the tools capability, and never feed back into
+    /// `responses` or `discovery_hash`.
+    fn rebuild_views(&mut self) {
+        self.initialize_view = tools::merge_initialize_result(self.server_info.clone());
+        self.tools_list_view = match self.responses.get(&McpDataKey::ToolsList).cloned() {
+            Some(list) => tools::merge_tools_list(list),
+            None => tools::merge_tools_list(serde_json::json!({"tools": []})),
+        };
+    }
 }
 
 /// Thread-safe discovery cache. Reads are fast and never cross await points.
@@ -112,10 +136,13 @@ impl Cache {
     /// backend server info from the successful initialize result.
     pub fn lookup(&self, key: &McpDataKey) -> Option<Value> {
         let guard = self.data.read().unwrap();
-        if *key == McpDataKey::Initialize {
-            return Some(guard.server_info.clone());
+        // Pure read of pre-built hold-state: the wrapper-merged views are
+        // rebuilt on load/refresh, never recomputed per request.
+        match key {
+            McpDataKey::Initialize => Some(guard.initialize_view.clone()),
+            McpDataKey::ToolsList => Some(guard.tools_list_view.clone()),
+            _ => guard.responses.get(key).cloned(),
         }
-        guard.responses.get(key).cloned()
     }
 
     /// Replace a cached entry after list_changed invalidation + refresh.
@@ -136,6 +163,7 @@ impl Cache {
         }
         guard.cache_epoch += 1;
         guard.discovery_hash = discovery_hash(&guard.server_info, &guard.responses);
+        guard.rebuild_views();
     }
 
     pub fn snapshot(&self) -> McpSnapshot {
@@ -195,6 +223,7 @@ impl Cache {
                     .get("capabilities")
                     .unwrap_or(&Value::Null),
             );
+            guard.rebuild_views();
         }
 
         RefreshReport {
@@ -301,7 +330,7 @@ async fn build_discovery_cache_from_backend(
     let capabilities_hash = hash_value(server_info.get("capabilities").unwrap_or(&Value::Null));
     let discovery_hash = discovery_hash(&server_info, &responses);
 
-    Ok(Cache::new(CachedData {
+    let mut data = CachedData {
         responses,
         server_info,
         capabilities,
@@ -309,7 +338,11 @@ async fn build_discovery_cache_from_backend(
         cache_epoch: 1,
         capabilities_hash,
         discovery_hash,
-    }))
+        tools_list_view: Value::Null,
+        initialize_view: Value::Null,
+    };
+    data.rebuild_views();
+    Ok(Cache::new(data))
 }
 
 fn discovery_data_keys() -> [McpDataKey; 4] {

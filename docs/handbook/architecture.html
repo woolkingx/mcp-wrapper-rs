@@ -17,7 +17,7 @@
 -> runtime or broker composition owner
 -> hook/observe control plane
 -> proof by tests, smoke, and readback</pre>
-  <p>The wrapper should be smarter about backend state through hooks and observation, not through scattered direct wiring. Observation turns backend events into typed state. Hooks request a legal transition. Readback proves the new state before clients, logs, or CLI projections claim it.</p>
+  <p>The wrapper should be smarter about backend state through hooks and observation, not through scattered direct wiring. Observation turns backend events into typed state. Hooks request a legal transition. Readback proves the new state before clients, logs, CLI projections, or MCP tool projections claim it.</p>
 </section>
 <section>
   <h2>Owner Map</h2>
@@ -25,20 +25,45 @@
     <tr><th>Owner</th><th>Owns</th><th>Must not own</th></tr>
     <tr><td><a href="../../src/main.rs"><code>main.rs</code></a></td><td>CLI flag parse, version/help, top-level normal/daemon/broker dispatch.</td><td>Runtime policy, protocol semantics, backend lifecycle decisions.</td></tr>
     <tr><td><a href="../../src/mcp_interface.rs"><code>mcp_interface</code></a></td><td>JSON-RPC line read/write, request/response/notification classification, MCP method route table, wrapper control method names.</td><td>Cache mutation, backend spawn/kill, daemon socket state.</td></tr>
-    <tr><td><a href="../../src/mcp_manager.rs"><code>mcp_manager</code></a></td><td>MCP initialize handshake, tool/resource/prompt discovery cache, capability filtering, cache epoch, refresh reports.</td><td>Child process lifecycle, client stdio loop, broker sessions.</td></tr>
-    <tr><td><a href="../../src/backend_manager.rs"><code>backend_manager</code></a></td><td>Child process slot, stdin/stdout/stderr, pending response match, process group, generation, degraded state, restart/stop/ping hooks.</td><td>MCP list semantics, cache writes, client routing policy.</td></tr>
+    <tr><td><a href="../../src/mcp_manager.rs"><code>mcp_manager</code></a></td><td>MCP initialize handshake, tool/resource/prompt discovery cache, capability filtering, cache epoch, refresh reports, and the externally served <code>tools/list</code> / <code>initialize</code> view hold-state.</td><td>Child process lifecycle, client stdio loop, broker sessions.</td></tr>
+    <tr><td><a href="../../src/tools/mod.rs"><code>tools</code></a></td><td>Unified external tools window, <code>mcp.wrapper</code> descriptor, action schema, invocation validation, result envelope, and object-method dispatch to existing owner APIs.</td><td>Backend process lifecycle, MCP discovery cache ownership, daemon socket state, or log identity.</td></tr>
+    <tr><td><a href="../../src/backend_manager.rs"><code>backend_manager</code></a></td><td>Child process slot, stdin/stdout/stderr, pending response match, process group, generation, degraded state, restart/stop/ping hooks, the live-backend query (<code>live()</code>), and the active-call rejection invariant.</td><td>MCP list semantics, cache writes, client routing policy.</td></tr>
     <tr><td><a href="../../src/runtime_manager.rs"><code>runtime_manager</code></a></td><td>Normal stdio loop, active call guard, pass-through composition, idle reaper, server-to-client response bridge.</td><td>Protocol schema, durable cache truth, daemon lock ownership.</td></tr>
     <tr><td><a href="../../src/daemon_manager.rs"><code>daemon_manager</code></a></td><td>UDS path, lock, pid/meta files, stale broker cleanup, client relay to broker.</td><td>Shared backend state or MCP routing.</td></tr>
-    <tr><td><a href="../../src/broker_manager.rs"><code>broker_manager</code></a></td><td>Shared daemon sessions, one backend/cache pair, fanout, active peer-session routing, broker-side wrapper hooks.</td><td>Daemon spawn lock, protocol schema invention, unsafe broadcast of request/response traffic.</td></tr>
+    <tr><td><a href="../../src/broker_manager.rs"><code>broker_manager</code></a></td><td>Shared daemon sessions, one backend/cache pair, broker-global active backend call counter, fanout, active peer-session routing, broker-side wrapper hooks.</td><td>Daemon spawn lock, protocol schema invention, unsafe broadcast of request/response traffic.</td></tr>
     <tr><td><a href="../../src/logging.rs"><code>logging</code></a></td><td>Command identity, log path, tracing setup.</td><td>Runtime decisions or backend state.</td></tr>
   </table>
+</section>
+<section>
+  <h2>Backend Lifecycle</h2>
+  <p>Owned by <code>backend_manager::BackendSlot</code>. The slot owns the alive decision, the restart/stop transitions, and the lifecycle invariants; callers reach live state only through owner methods (<code>live()</code>, <code>snapshot()</code>, <code>restart()</code>, <code>stop()</code>, <code>ensure()</code>), never by locking the raw backend handle.</p>
+  <table>
+    <tr><th>Rule</th><th>Behaviour</th></tr>
+    <tr><td>Lazy spawn</td><td>Backend created on first pass-through request, not at startup.</td></tr>
+    <tr><td>Retry</td><td>3 attempts with exponential backoff on spawn failure, then degraded + cooldown.</td></tr>
+    <tr><td>Health check</td><td><code>live()</code> returns the backend only if present and alive; dead backends map to a unavailable error.</td></tr>
+    <tr><td>Graceful shutdown</td><td>SIGTERM, 5s wait, then SIGKILL.</td></tr>
+    <tr><td>Process group cleanup</td><td>Each child in its own process group; <code>child_pgids</code> registry; killpg on exit.</td></tr>
+    <tr><td>Cache refresh on respawn</td><td>Synchronous refresh (query all list/* from backend) before notifying clients, so clients never read stale cache.</td></tr>
+    <tr><td>Active-call gate</td><td>Stop and non-force restart are rejected while active calls exist. The invariant is owned by <code>BackendSlot::{restart,stop}_blocked_by_active_calls</code>; the active-call counter is owned by the caller (<code>runtime_manager</code> normal mode, <code>broker_manager</code> daemon mode).</td></tr>
+    <tr><td>Daemon init reuse</td><td>Daemon/broker mode keeps the init backend alive instead of killing and re-spawning on first request.</td></tr>
+    <tr><td>Daemon no idle timeout</td><td>A broker spawned via <code>--daemon</code> runs until SIGTERM; idle timeout applies only to non-daemon relay mode.</td></tr>
+  </table>
+</section>
+<section>
+  <h2>Concurrency</h2>
+  <ul>
+    <li>Oneshot channels match request/response (client ID remapped to a monotonic backend ID, restored on response).</li>
+    <li><code>tokio::sync::Mutex</code> guards backend access because the lock spans <code>.await</code>; <code>child_pgids</code> uses <code>std::sync::Mutex</code> because access is sync-only.</li>
+    <li>Bidirectional notification relay runs between client and backend.</li>
+  </ul>
 </section>
 <section>
   <h2>Planes</h2>
   <table>
     <tr><th>Plane</th><th>Path</th><th>Rule</th></tr>
-    <tr><td>Data plane</td><td><code>client stdio -> mcp_interface -> runtime_manager -> mcp_manager | backend_manager -> child stdio</code></td><td>JSON-RPC envelopes carry MCP discovery and dynamic call data. Requests either read cached MCP tool/resource/prompt data, return local wrapper response, or pass through with ID restoration.</td></tr>
-    <tr><td>Daemon data plane</td><td><code>client stdio -> daemon_manager UDS relay -> broker_manager -> mcp_manager | backend_manager</code></td><td>Daemon clients do not own backend state. The broker owns the shared backend/cache pair.</td></tr>
+    <tr><td>Data plane</td><td><code>client stdio -> mcp_interface -> runtime_manager -> mcp_manager | tools | backend_manager -> child stdio</code></td><td>JSON-RPC envelopes carry MCP discovery, <code>mcp.wrapper</code> action calls, and dynamic call data. Requests either read cached MCP tool/resource/prompt data, invoke a wrapper tool object method, return local wrapper response, or pass through with ID restoration.</td></tr>
+    <tr><td>Daemon data plane</td><td><code>client stdio -> daemon_manager UDS relay -> broker_manager -> mcp_manager | tools | backend_manager</code></td><td>Daemon clients do not own backend state. The broker owns the shared backend/cache pair and calls <code>tools</code> only with broker-owned context.</td></tr>
     <tr><td>Control plane</td><td><code>observe -> owner state -> hook -> transition -> readback -> evidence</code></td><td>No component may infer backend truth from a notification alone.</td></tr>
     <tr><td>Evidence plane</td><td><code>snapshot, generation, cache epoch, pid/meta, logs, tests, smoke</code></td><td>Status is a readback product, not a hope attached to a command.</td></tr>
   </table>
@@ -56,8 +81,35 @@
   <p>Notifications remain signals. They may trigger observation or cache refresh, but they do not become lifecycle truth until the owning manager publishes a snapshot or refresh report.</p>
 </section>
 <section>
+  <h2>Tools Projection</h2>
+  <p><code>src/tools</code> is the unified external tools window. It exposes exactly one wrapper-owned backend-visible tool, <code>mcp.wrapper</code>. CLI backend admin commands and MCP <code>mcp.wrapper</code> calls are interface projections into the same action schema and object-method dispatch layer.</p>
+  <pre>tools/list
+  -> backend cached tools + tools::catalog().mcp.wrapper
+
+tools/call(name = "mcp.wrapper")
+  -> tools::invoke(action, target, params, context)
+  -> tools.object.method
+  -> backend_manager | mcp_manager | broker_manager | daemon_manager owner API
+  -> unified readback envelope</pre>
+  <p><code>tools</code> owns action names, input validation, descriptor generation, collision policy for the reserved <code>mcp.wrapper</code> name, and response envelope shape. It must not own backend lifecycle truth, discovery cache mutation, daemon socket state, or log identity. In daemon mode, <code>mcp.wrapper</code> receives broker-owned active-call readback before stop and non-force restart actions. Backend tools named <code>mcp.wrapper</code> are rejected before they can enter the merged tool table.</p>
+  <p>Validation is internalized into the invocation objects: <code>ToolAction</code> owns its action-specific param constraints (<code>validate_params</code>), and <code>ToolInvocation::from_arguments</code> owns the full invocation invariant — a successfully constructed invocation is always schema-valid. The free dispatch path only routes data into these objects; it holds no validation rules of its own.</p>
+  <p>The reserved <code>mcp.wrapper</code> descriptor and the tools capability are not merged per request. <code>mcp_manager::Cache</code> owns the lifetime of the external <code>tools/list</code> and <code>initialize</code> views as hold-state: they are rebuilt only when backend data loads or refreshes, so <code>lookup</code> is a pure read. The backend discovery fingerprint (<code>discovery_hash</code>) is computed from raw backend responses only and is never polluted by the wrapper-merged view.</p>
+</section>
+<section>
+  <h2>Supervisor Registry Boundary</h2>
+  <p>Multi-backend supervisor mode requires a registry owner before code. The registry owns backend identity, backend specs, route-table construction, collision state, and reload semantics. It does not replace <code>backend_manager</code> or <code>mcp_manager</code>; each registry entry points to one backend slot owner and one discovery cache owner.</p>
+  <pre>SupervisorRegistry
+  backendSpecs: backend id -> command, args, env projection, cwd, policy
+  backendSlots: backend id -> backend_manager::BackendSlot
+  discoveryCaches: backend id -> mcp_manager::Cache
+  toolRoutes: backend tool name -> backend id
+  wrapperRoute: mcp.wrapper -> tools object method
+  collisions: tool name -> backend ids + policy state</pre>
+  <p>The first registry implementation must fail closed on backend tool-name collisions. A stale or ambiguous route returns structured <code>mcp.wrapper</code> evidence instead of guessing at call time. Restarting one backend refreshes only that backend cache, then rebuilds the union route table and discovery hash.</p>
+</section>
+<section>
   <h2>Admin CLI Projection</h2>
-  <p>The admin surface is a projection over the same hook/observe owners, not a second backend manager. A CLI command may read status, request restart, stop, refresh, list broker metadata, or run doctor checks only by calling the owning manager path and printing readback.</p>
+  <p>The admin surface is a projection over the same tools object methods and hook/observe owners, not a second backend manager. Backend admin commands call <code>mcp.wrapper</code> through the broker JSON-RPC path and then project the wrapper envelope into CLI output. Broker metadata commands still use <code>daemon_manager</code> because broker socket and pid state are not backend tool state.</p>
   <pre>mcp-wrapper-rs status --json -- &lt;command&gt; [args...]
 mcp-wrapper-rs backend status|ping|refresh|restart|stop --json -- &lt;command&gt; [args...]
 mcp-wrapper-rs broker list|status|stop|restart --json -- &lt;command&gt; [args...]

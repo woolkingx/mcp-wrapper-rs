@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::backend_manager::{BackendEvent, ChildPgids};
 use crate::mcp_interface::Route;
-use crate::{backend_manager, logging, mcp_interface, mcp_manager};
+use crate::{backend_manager, logging, mcp_interface, mcp_manager, tools};
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -304,6 +304,20 @@ async fn handle_request(
     pass_through_lock: Arc<Mutex<()>>,
     out_tx: mpsc::UnboundedSender<Value>,
 ) {
+    if tools::is_wrapper_tool_call(&raw) {
+        let result = tools::invoke(
+            &raw,
+            tools::InvocationContext {
+                cache: &cache,
+                backend_slot: &backend_slot,
+                active_calls: &active_calls,
+            },
+        )
+        .await;
+        let _ = out_tx.send(mcp_interface::build_response(client_id, result));
+        return;
+    }
+
     let resp = match mcp_interface::route(&method) {
         Route::McpData(key) => {
             debug!(method = %method, "serving from cache");

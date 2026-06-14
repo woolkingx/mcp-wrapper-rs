@@ -5,19 +5,19 @@
 //! (setsid in daemon.rs). Exits after all sessions disconnect + 60s idle.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::backend_manager::{Backend, BackendEvent, ChildPgids};
 use crate::mcp_interface::{self, Route};
-use crate::{backend_manager, daemon_manager, mcp_manager};
+use crate::{backend_manager, daemon_manager, mcp_manager, tools};
 
 const BROKER_IDLE_SECS: u64 = 60;
 
@@ -27,8 +27,32 @@ struct BrokerState {
     backend_slot: backend_manager::BackendSlot,
     sessions: Mutex<HashMap<u64, mpsc::UnboundedSender<Value>>>,
     active_peer_session: Mutex<Option<u64>>,
+    active_backend_calls: Arc<AtomicUsize>,
     pass_through_lock: Mutex<()>,
     next_session_id: AtomicU64,
+}
+
+struct BrokerActiveCallGuard {
+    session_calls: Arc<AtomicUsize>,
+    broker_calls: Arc<AtomicUsize>,
+}
+
+impl BrokerActiveCallGuard {
+    fn new(session_calls: Arc<AtomicUsize>, broker_calls: Arc<AtomicUsize>) -> Self {
+        session_calls.fetch_add(1, Ordering::AcqRel);
+        broker_calls.fetch_add(1, Ordering::AcqRel);
+        Self {
+            session_calls,
+            broker_calls,
+        }
+    }
+}
+
+impl Drop for BrokerActiveCallGuard {
+    fn drop(&mut self) {
+        self.session_calls.fetch_sub(1, Ordering::AcqRel);
+        self.broker_calls.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Entry point for `--broker-internal`. Called from `main()` BEFORE tokio runtime.
@@ -110,6 +134,7 @@ async fn broker_main(
         backend_slot,
         sessions: Mutex::new(HashMap::new()),
         active_peer_session: Mutex::new(None),
+        active_backend_calls: Arc::new(AtomicUsize::new(0)),
         pass_through_lock: Mutex::new(()),
         next_session_id: AtomicU64::new(1),
     });
@@ -451,6 +476,20 @@ async fn handle_request(
     session_tx: mpsc::UnboundedSender<Value>,
     active_session_calls: Arc<AtomicUsize>,
 ) {
+    if tools::is_wrapper_tool_call(&raw) {
+        let result = tools::invoke(
+            &raw,
+            tools::InvocationContext {
+                cache: &state.cache,
+                backend_slot: &state.backend_slot,
+                active_calls: &state.active_backend_calls,
+            },
+        )
+        .await;
+        let _ = session_tx.send(mcp_interface::build_response(client_id, result));
+        return;
+    }
+
     let resp = match mcp_interface::route(&method) {
         Route::McpData(key) => {
             debug!(session = session_id, method = %method, "broker: cache");
@@ -468,11 +507,23 @@ async fn handle_request(
             mcp_interface::build_response(client_id, Value::Object(serde_json::Map::new()))
         }
         Route::WrapperControl(control) => {
-            handle_wrapper_control(client_id, control, raw, &state.cache, &state.backend_slot).await
+            handle_wrapper_control(
+                client_id,
+                control,
+                raw,
+                &state.cache,
+                &state.backend_slot,
+                &state.active_backend_calls,
+            )
+            .await
         }
         Route::PassThrough => {
-            active_session_calls.fetch_add(1, Ordering::AcqRel);
+            let active_call_guard = BrokerActiveCallGuard::new(
+                active_session_calls.clone(),
+                state.active_backend_calls.clone(),
+            );
             tokio::spawn(async move {
+                let _active_call_guard = active_call_guard;
                 let _serialize_backend_call = state.pass_through_lock.lock().await;
                 info!(session = session_id, method = %method, "broker: pass-through");
 
@@ -485,7 +536,6 @@ async fn handle_request(
                         None,
                     );
                     let _ = session_tx.send(resp);
-                    active_session_calls.fetch_sub(1, Ordering::AcqRel);
                     return;
                 }
 
@@ -504,7 +554,6 @@ async fn handle_request(
                             None,
                         );
                         let _ = session_tx.send(resp);
-                        active_session_calls.fetch_sub(1, Ordering::AcqRel);
                         return;
                     }
                 };
@@ -539,7 +588,6 @@ async fn handle_request(
                 };
 
                 let _ = session_tx.send(resp);
-                active_session_calls.fetch_sub(1, Ordering::AcqRel);
             });
             return;
         }
@@ -554,6 +602,7 @@ async fn handle_wrapper_control(
     raw: Value,
     cache: &Arc<mcp_manager::Cache>,
     backend_slot: &backend_manager::BackendSlot,
+    active_calls: &Arc<AtomicUsize>,
 ) -> Value {
     match control {
         mcp_interface::WrapperControlMethod::BackendStatus => {
@@ -593,6 +642,17 @@ async fn handle_wrapper_control(
                 .and_then(|v| v.get("force"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            if backend_manager::BackendSlot::restart_blocked_by_active_calls(
+                active_calls.load(Ordering::Acquire),
+                force,
+            ) {
+                return mcp_interface::build_error_response(
+                    client_id,
+                    mcp_interface::error_codes::INTERNAL_ERROR,
+                    "backend restart rejected while calls are active",
+                    None,
+                );
+            }
             if let Err(e) = backend_slot.restart(force).await {
                 return mcp_interface::build_error_response(
                     client_id,
@@ -601,14 +661,9 @@ async fn handle_wrapper_control(
                     None,
                 );
             }
-            let backend = backend_slot.handle();
-            let be = {
-                let guard = backend.lock().await;
-                guard.as_ref().cloned()
-            };
-            let be = match be {
-                Some(be) if be.is_alive() => be,
-                _ => {
+            let be = match backend_slot.live().await {
+                Some(be) => be,
+                None => {
                     return mcp_interface::build_error_response(
                         client_id,
                         mcp_interface::error_codes::INTERNAL_ERROR,
@@ -621,6 +676,16 @@ async fn handle_wrapper_control(
             mcp_interface::build_response(client_id, report.to_value())
         }
         mcp_interface::WrapperControlMethod::BackendStop => {
+            if backend_manager::BackendSlot::stop_blocked_by_active_calls(
+                active_calls.load(Ordering::Acquire),
+            ) {
+                return mcp_interface::build_error_response(
+                    client_id,
+                    mcp_interface::error_codes::INTERNAL_ERROR,
+                    "backend stop rejected while calls are active",
+                    None,
+                );
+            }
             backend_slot.stop().await;
             let backend = backend_slot.snapshot().await;
             mcp_interface::build_response(client_id, backend.to_value())

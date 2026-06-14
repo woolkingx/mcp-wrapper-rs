@@ -29,6 +29,11 @@ if "--sleep-init" in sys.argv:
 
 peer_id_collides = "--peer-id-collides" in sys.argv
 
+sleep_call = 0.0
+if "--sleep-call" in sys.argv:
+    sleep_call_index = sys.argv.index("--sleep-call") + 1
+    sleep_call = float(sys.argv[sleep_call_index])
+
 exit_after_call_marker = None
 if "--exit-after-call-once" in sys.argv:
     exit_index = sys.argv.index("--exit-after-call-once") + 1
@@ -89,6 +94,8 @@ for line in sys.stdin:
                     break
             continue
         arg_msg = params.get("arguments", {}).get("msg", "")
+        if sleep_call > 0:
+            time.sleep(sleep_call)
         send({"jsonrpc": "2.0", "id": mid, "result": {
             "content": [{"type": "text", "text": arg_msg}]
         }})

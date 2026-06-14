@@ -5,9 +5,11 @@
 <h1>Topology</h1>
 <section>
   <h2>Allowed Crossings</h2>
-  <pre>client stdio -> mcp_interface -> runtime_manager -> mcp_manager | backend_manager -> child MCP server
-daemon client stdio -> daemon_manager -> broker_manager -> mcp_manager | backend_manager -> shared child MCP server
+  <pre>client stdio -> mcp_interface -> runtime_manager -> mcp_manager | tools | backend_manager -> child MCP server
+daemon client stdio -> daemon_manager -> broker_manager -> mcp_manager | tools | backend_manager -> shared child MCP server
 backend observe signal -> backend_manager state -> mcp_manager cache epoch -> runtime_manager | broker_manager evidence
+mcp.wrapper tool call -> tools object method -> backend_manager | mcp_manager -> readback response
+future supervisor registry -> backend id -> backend_manager slot | mcp_manager cache
 wrapper hook method -> mcp_interface -> backend_manager | mcp_manager -> readback response</pre>
 </section>
 <section>
@@ -15,8 +17,11 @@ wrapper hook method -> mcp_interface -> backend_manager | mcp_manager -> readbac
   <table>
     <tr><th>From</th><th>To</th><th>Edge</th></tr>
     <tr><td><code>mcp_interface</code></td><td><code>mcp_manager</code></td><td>Only cacheable MCP methods may read discovery cache.</td></tr>
-    <tr><td><code>mcp_interface</code></td><td><code>backend_manager</code></td><td>Only wrapper hook methods may control backend lifecycle.</td></tr>
-    <tr><td><code>runtime_manager</code>/<code>broker_manager</code></td><td><code>backend_manager</code></td><td>Only pass-through calls and legal hooks may reach backend process state.</td></tr>
+    <tr><td><code>mcp_interface</code></td><td><code>tools</code></td><td>Only <code>tools/call</code> with name <code>mcp.wrapper</code> may enter wrapper tool invocation.</td></tr>
+    <tr><td><code>tools</code></td><td><code>backend_manager</code>/<code>mcp_manager</code></td><td>Only validated object methods may request lifecycle transitions or cache readback through owner APIs.</td></tr>
+    <tr><td>future supervisor registry</td><td><code>backend_manager</code>/<code>mcp_manager</code></td><td>Registry entries address backend slots and discovery caches by backend id; they do not mutate lifecycle or cache state directly.</td></tr>
+    <tr><td><code>mcp_interface</code></td><td><code>backend_manager</code></td><td>Only internal wrapper hook methods may control backend lifecycle.</td></tr>
+    <tr><td><code>runtime_manager</code>/<code>broker_manager</code></td><td><code>backend_manager</code></td><td>Only pass-through calls, <code>tools</code> methods, and legal hooks may reach backend process state.</td></tr>
     <tr><td><code>backend_manager</code></td><td><code>mcp_manager</code></td><td>Observed process or protocol signals may trigger cache refresh, never ad hoc cache mutation.</td></tr>
     <tr><td><code>daemon_manager</code></td><td><code>broker_manager</code></td><td>Daemon clients cross through UDS, not direct backend ownership.</td></tr>
   </table>

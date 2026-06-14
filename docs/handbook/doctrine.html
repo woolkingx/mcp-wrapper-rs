@@ -5,15 +5,16 @@
 <h1>Doctrine</h1>
 <section>
   <h2>Constitution</h2>
-  <p>The wrapper does one job: keep MCP stdio servers cheap when they are idle while preserving raw JSON-RPC behavior for dynamic work.</p>
-  <p>The controlling rule is: cache what is static, proxy what is dynamic. The wrapper must not become an MCP SDK, rule engine, or semantic owner of backend behavior.</p>
+  <p>The wrapper does one job: keep MCP stdio servers cheap and controllable while preserving raw JSON-RPC behavior for backend-owned dynamic work.</p>
+  <p>The controlling rule is: cache static discovery, proxy backend-owned dynamics, expose wrapper lifecycle through <code>mcp.wrapper</code>, and prove state transitions by owner readback. The wrapper must not become an MCP SDK, rule engine, or semantic owner of backend behavior.</p>
 </section>
 <section>
   <h2>First Principles</h2>
   <ul>
     <li>JSON-RPC line protocol is the transport boundary.</li>
     <li>MCP initialize and list results are stable enough to cache after backend handshake.</li>
-    <li>Tool calls, resource reads, prompts, completions, logging, subscriptions, and unknown future methods belong to the backend.</li>
+    <li><code>src/tools</code> owns the wrapper tool schema and dispatch surface; CLI and MCP are projections over that owner.</li>
+    <li><code>mcp.wrapper</code> is the reserved wrapper-owned MCP tool. Other tool calls, resource reads, prompts, completions, logging, subscriptions, and unknown future methods belong to the backend.</li>
     <li>Backend subprocesses are external resources and must be isolated in process groups.</li>
     <li>Daemon sharing is legal only when a single backend is correct for the server's state model.</li>
   </ul>
