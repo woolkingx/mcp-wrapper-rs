@@ -11,6 +11,8 @@
 
 mod admin_cli;
 mod backend_manager;
+#[cfg(test)]
+mod backend_manager_tests;
 mod broker_manager;
 mod cli;
 #[cfg(test)]
@@ -18,12 +20,23 @@ mod cli_tests;
 mod daemon_manager;
 #[cfg(test)]
 mod daemon_manager_tests;
+mod event_plane;
+#[cfg(test)]
+mod event_plane_tests;
+mod lifetime;
+#[cfg(test)]
+mod lifetime_tests;
 mod logging;
 mod mcp_interface;
 #[cfg(test)]
 mod mcp_interface_tests;
 mod mcp_manager;
+#[cfg(test)]
+mod mcp_manager_tests;
 mod runtime_manager;
+mod timeouts;
+#[cfg(test)]
+mod timeouts_tests;
 mod tools;
 
 use cli::CliMode;

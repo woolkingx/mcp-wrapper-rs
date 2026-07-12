@@ -1,21 +1,24 @@
 //! MCP manager owner: session handshake, capabilities, discovery cache, and refresh rules.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::backend_manager::{Backend, BackendEvent, ChildPgids};
+use crate::backend_manager::{Backend, BackendEvent, BackendSlot, ChildPgids};
 use crate::mcp_interface::{self, McpDataKey};
+use crate::timeouts;
 use crate::tools;
 
 /// Timeout for individual list/* queries during init.
 /// Separate from --init-timeout, which covers the initialize handshake.
-const LIST_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const LIST_QUERY_TIMEOUT: Duration = Duration::from_secs(timeouts::CACHE_LIST_QUERY_TIMEOUT_SECS);
+const CACHE_REFRESH_TIMEOUT: Duration = Duration::from_secs(timeouts::CACHE_REFRESH_TIMEOUT_SECS);
 
 /// Parsed MCP server capabilities from the initialize handshake.
 /// Determines which list/* methods to query and cache.
@@ -83,6 +86,7 @@ impl CachedData {
 /// Thread-safe discovery cache. Reads are fast and never cross await points.
 pub struct Cache {
     data: std::sync::RwLock<CachedData>,
+    refresh_lock: Mutex<()>,
 }
 
 pub struct McpSnapshot {
@@ -129,6 +133,7 @@ impl Cache {
     fn new(data: CachedData) -> Self {
         Self {
             data: std::sync::RwLock::new(data),
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -145,27 +150,6 @@ impl Cache {
         }
     }
 
-    /// Replace a cached entry after list_changed invalidation + refresh.
-    /// Unsupported capability slots are intentionally ignored.
-    pub fn update(&self, key: &McpDataKey, value: Value) {
-        let mut guard = self.data.write().unwrap();
-        if *key == McpDataKey::Initialize {
-            guard.server_info = value;
-            guard.capabilities = Capabilities::from_server_info(&guard.server_info);
-            guard.capabilities_hash = hash_value(
-                guard
-                    .server_info
-                    .get("capabilities")
-                    .unwrap_or(&Value::Null),
-            );
-        } else if guard.capabilities.supports(key) {
-            guard.responses.insert(*key, value);
-        }
-        guard.cache_epoch += 1;
-        guard.discovery_hash = discovery_hash(&guard.server_info, &guard.responses);
-        guard.rebuild_views();
-    }
-
     pub fn snapshot(&self) -> McpSnapshot {
         let guard = self.data.read().unwrap();
         McpSnapshot {
@@ -177,14 +161,36 @@ impl Cache {
         }
     }
 
-    pub async fn refresh_all(&self, backend: &Backend, backend_generation: u64) -> RefreshReport {
-        let (old_backend_generation, old_cache_epoch, old_discovery_hash, old_server_info) = {
+    pub async fn refresh_all(&self, backend_slot: &BackendSlot) -> Result<RefreshReport, String> {
+        self.refresh_keys(backend_slot, &discovery_data_keys())
+            .await
+    }
+
+    pub async fn refresh_keys(
+        &self,
+        backend_slot: &BackendSlot,
+        keys: &[McpDataKey],
+    ) -> Result<RefreshReport, String> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+        let backend = backend_slot
+            .live()
+            .await
+            .ok_or_else(|| "backend unavailable for cache refresh".to_string())?;
+        let backend_generation = backend_slot.generation();
+        let (
+            old_backend_generation,
+            old_cache_epoch,
+            old_discovery_hash,
+            old_server_info,
+            old_responses,
+        ) = {
             let guard = self.data.read().unwrap();
             (
                 guard.backend_generation,
                 guard.cache_epoch,
                 guard.discovery_hash.clone(),
                 guard.server_info.clone(),
+                guard.responses.clone(),
             )
         };
 
@@ -194,10 +200,15 @@ impl Cache {
             .unwrap_or(old_server_info);
         let capabilities = Capabilities::from_server_info(&server_info);
 
-        let mut responses = HashMap::new();
-        for key in discovery_data_keys() {
-            let result = query_list_or_empty(backend, &capabilities, key).await;
-            responses.insert(key, result);
+        let deadline = cache_refresh_deadline();
+        let mut responses = old_responses;
+        for key in keys.iter().copied() {
+            if !capabilities.supports(&key) {
+                responses.insert(key, empty_result_for(&key));
+            } else {
+                let result = query_list_drained(&backend, key, Some(deadline)).await?;
+                responses.insert(key, result);
+            }
         }
 
         let new_discovery_hash = discovery_hash(&server_info, &responses);
@@ -211,6 +222,16 @@ impl Cache {
 
         {
             let mut guard = self.data.write().unwrap();
+            if backend_slot.generation() != backend_generation {
+                return Err(
+                    "backend generation changed while refresh candidate was building".into(),
+                );
+            }
+            if guard.cache_epoch != old_cache_epoch
+                || guard.backend_generation != old_backend_generation
+            {
+                return Err("cache snapshot changed while refresh candidate was building".into());
+            }
             guard.responses = responses;
             guard.server_info = server_info;
             guard.capabilities = capabilities;
@@ -226,13 +247,13 @@ impl Cache {
             guard.rebuild_views();
         }
 
-        RefreshReport {
+        Ok(RefreshReport {
             old_cache_epoch,
             new_cache_epoch,
             old_discovery_hash,
             new_discovery_hash,
             changed,
-        }
+        })
     }
 }
 
@@ -242,7 +263,7 @@ pub fn build_initialize_request(id: Value) -> Value {
         id,
         "initialize",
         Some(serde_json::json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": protocol_version_today(),
             "capabilities": {},
             "clientInfo": {
                 "name": "mcp-wrapper-rs",
@@ -252,8 +273,77 @@ pub fn build_initialize_request(id: Value) -> Value {
     )
 }
 
-fn build_list_request(id: Value, method: &str) -> Value {
-    mcp_interface::build_request(id, method, None)
+pub(crate) fn protocol_version_today() -> String {
+    let unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    protocol_version_for_unix_seconds_local(unix_seconds)
+}
+
+pub(crate) fn protocol_version_for_unix_seconds_local(unix_seconds: i64) -> String {
+    let mut local_time = libc::tm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 1,
+        tm_mon: 0,
+        tm_year: 70,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: -1,
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))]
+        tm_gmtoff: 0,
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))]
+        tm_zone: std::ptr::null_mut(),
+    };
+    let raw_time = unix_seconds as libc::time_t;
+    let ok = unsafe { !libc::localtime_r(&raw_time, &mut local_time).is_null() };
+    if ok {
+        return format!(
+            "{:04}-{:02}-{:02}",
+            local_time.tm_year + 1900,
+            local_time.tm_mon + 1,
+            local_time.tm_mday
+        );
+    }
+    protocol_version_for_unix_days(unix_seconds / 86_400)
+}
+
+pub(crate) fn protocol_version_for_unix_days(unix_days: i64) -> String {
+    let (year, month, day) = civil_from_unix_days(unix_days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn civil_from_unix_days(unix_days: i64) -> (i64, u32, u32) {
+    let z = unix_days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month as u32, day as u32)
+}
+
+fn build_list_request(id: Value, method: &str, cursor: Option<String>) -> Value {
+    let params = cursor.map(|cursor| serde_json::json!({ "cursor": cursor }));
+    mcp_interface::build_request(id, method, params)
 }
 
 fn empty_result_for(key: &McpDataKey) -> Value {
@@ -367,21 +457,146 @@ async fn query_list_or_empty(
         return empty_result_for(&key);
     }
 
+    query_list_drained_or_empty(backend, key).await
+}
+
+pub async fn query_list_drained_or_empty(backend: &Backend, key: McpDataKey) -> Value {
+    query_list_drained(backend, key, None)
+        .await
+        .unwrap_or_else(|_| empty_result_for(&key))
+}
+
+pub fn cache_refresh_deadline() -> Instant {
+    Instant::now() + CACHE_REFRESH_TIMEOUT
+}
+
+async fn query_list_drained(
+    backend: &Backend,
+    key: McpDataKey,
+    deadline: Option<Instant>,
+) -> Result<Value, String> {
     let method = mcp_interface::method_for_mcp_data_key(&key);
-    let req = build_list_request(backend.next_request_id(), method);
-    match tokio::time::timeout(LIST_QUERY_TIMEOUT, backend.send_request(req)).await {
-        Ok(Ok(resp)) => resp
-            .get("result")
-            .cloned()
-            .unwrap_or(empty_result_for(&key)),
-        Ok(Err(e)) => {
-            warn!(method = method, err = %e, "mcp_manager: list query failed");
-            empty_result_for(&key)
+    let field = list_field_for(&key);
+    let mut merged = empty_result_for(&key);
+    let mut cursor: Option<String> = None;
+    for page_index in 0..timeouts::CACHE_PAGINATION_MAX_PAGES {
+        let request_timeout = match deadline {
+            Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+                Some(remaining) if remaining > Duration::ZERO => remaining.min(LIST_QUERY_TIMEOUT),
+                _ => {
+                    warn!(
+                        method = method,
+                        page_index = page_index,
+                        "mcp_manager: cache refresh timeout"
+                    );
+                    return Err(format!("{method}: cache refresh deadline exceeded"));
+                }
+            },
+            None => LIST_QUERY_TIMEOUT,
+        };
+        let req = build_list_request(backend.next_request_id(), method, cursor.clone());
+        let result = match backend
+            .send_request_with_timeout(req, request_timeout)
+            .await
+        {
+            Ok(resp) => validate_list_response(&resp, field, method, page_index)?,
+            Err(e) => {
+                warn!(
+                    method = method,
+                    page_index = page_index,
+                    err = %e,
+                    "mcp_manager: list query failed"
+                );
+                return Err(format!("{method}: list query failed: {e}"));
+            }
+        };
+
+        append_page_items(&mut merged, &result, field);
+        cursor = result
+            .get("nextCursor")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        if cursor.is_none() {
+            return Ok(merged);
         }
-        Err(_) => {
-            warn!(method = method, "mcp_manager: list query timeout");
-            empty_result_for(&key)
-        }
+    }
+
+    warn!(
+        method = method,
+        max_pages = timeouts::CACHE_PAGINATION_MAX_PAGES,
+        page_index = timeouts::CACHE_PAGINATION_MAX_PAGES - 1,
+        "mcp_manager: pagination drain cap reached"
+    );
+    Err(format!("{method}: pagination drain cap reached"))
+}
+
+pub(crate) fn validate_list_response(
+    response: &Value,
+    field: &str,
+    method: &str,
+    page_index: usize,
+) -> Result<Value, String> {
+    if let Some(error) = response.get("error") {
+        return Err(format!(
+            "{method}: backend error on page {page_index}: {error}"
+        ));
+    }
+    let result = response
+        .get("result")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| format!("{method}: missing object result on page {page_index}"))?;
+    if !result.get(field).is_some_and(Value::is_array) {
+        return Err(format!(
+            "{method}: result.{field} is not an array on page {page_index}"
+        ));
+    }
+    if result
+        .get("nextCursor")
+        .is_some_and(|cursor| !cursor.is_null() && !cursor.is_string())
+    {
+        return Err(format!(
+            "{method}: result.nextCursor is not a string on page {page_index}"
+        ));
+    }
+    Ok(result)
+}
+
+pub fn cached_list_request_has_cursor(key: &McpDataKey, raw: &Value) -> bool {
+    !matches!(key, McpDataKey::Initialize)
+        && raw
+            .get("params")
+            .and_then(|params| params.get("cursor"))
+            .map(|cursor| !cursor.is_null())
+            .unwrap_or(false)
+}
+
+fn list_field_for(key: &McpDataKey) -> &'static str {
+    match key {
+        McpDataKey::ToolsList => "tools",
+        McpDataKey::PromptsList => "prompts",
+        McpDataKey::ResourcesList => "resources",
+        McpDataKey::ResourceTemplatesList => "resourceTemplates",
+        McpDataKey::Initialize => "",
+    }
+}
+
+fn append_page_items(merged: &mut Value, page: &Value, field: &str) {
+    if field.is_empty() {
+        return;
+    }
+    if !merged
+        .get(field)
+        .map(|value| value.is_array())
+        .unwrap_or(false)
+    {
+        merged[field] = serde_json::json!([]);
+    }
+    let Some(target) = merged.get_mut(field).and_then(|value| value.as_array_mut()) else {
+        return;
+    };
+    if let Some(items) = page.get(field).and_then(|value| value.as_array()) {
+        target.extend(items.iter().cloned());
     }
 }
 

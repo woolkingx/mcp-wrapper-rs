@@ -11,4 +11,4 @@ mod tests;
 pub mod wrapper;
 
 pub use schema::InvocationContext;
-pub use wrapper::{invoke, is_wrapper_tool_call, merge_initialize_result, merge_tools_list};
+pub use wrapper::{invoke, merge_initialize_result, merge_tools_list};

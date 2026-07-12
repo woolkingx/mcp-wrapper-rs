@@ -1,4 +1,3 @@
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -63,7 +62,7 @@ pub struct ToolInvocation {
 pub struct InvocationContext<'a> {
     pub cache: &'a Arc<mcp_manager::Cache>,
     pub backend_slot: &'a backend_manager::BackendSlot,
-    pub active_calls: &'a Arc<AtomicUsize>,
+    pub active_calls: usize,
 }
 
 impl ToolInvocation {
@@ -123,9 +122,9 @@ impl ToolInvocation {
                 "`params` must be an object when present",
             ));
         }
-        action.validate_params(&params).map_err(|msg| {
-            error_envelope(action.name(), &target, "invalidParams", msg)
-        })?;
+        action
+            .validate_params(&params)
+            .map_err(|msg| error_envelope(action.name(), &target, "invalidParams", msg))?;
 
         Ok(Self {
             action,

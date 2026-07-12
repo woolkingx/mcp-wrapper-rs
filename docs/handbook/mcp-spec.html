@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MCP Spec Reference</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<p><a href="index.html">Back to handbook</a></p>
+<h1>MCP Spec Reference</h1>
+
+<section>
+  <h2>Purpose &amp; Scope</h2>
+  <p>This chapter records the official Model Context Protocol requirements that an
+  stdio proxy/wrapper must honor. It is the <strong>upstream contract</strong>: what the
+  spec demands. It is a reusable reference, version-pinned and citable, not a
+  status report. Our own compliance state and remediation work live in
+  <code>docs/plan/2026-06-22-mcp-spec-compliance-audit.md</code>, not here.</p>
+  <p>Reading split: <a href="schema.html">Schema</a> owns <em>our</em> legal shapes;
+  this chapter owns the <em>MCP spec's</em> requirements on a proxy.</p>
+</section>
+
+<section>
+  <h2>Source Of Truth</h2>
+  <table>
+    <tr><th>Role</th><th>Version</th><th>Status</th></tr>
+    <tr><td>Canonical reference</td><td><code>2025-06-18</code></td><td>Current spec; primary citation source.</td></tr>
+    <tr><td>Cross-check</td><td><code>2024-11-05</code></td><td>Prior version; used to track level changes (e.g. SHOULD&rarr;MUST).</td></tr>
+    <tr><td>Schema</td><td><code>schema/2025-06-18/schema.ts</code></td><td>Error codes, message unions, field shapes.</td></tr>
+  </table>
+  <p>Authoritative origin: <code>github.com/modelcontextprotocol/modelcontextprotocol</code>,
+  <code>docs/specification/&lt;version&gt;/</code>. No <code>2025-11-25</code> version exists in the
+  repository; any earlier reference to it in project docs was an error. Requirement
+  levels (MUST / MUST NOT / SHOULD / SHOULD NOT / MAY) are quoted from the live spec.</p>
+</section>
+
+<section>
+  <h2>A. Lifecycle &amp; Version Negotiation</h2>
+  <p>Source: <code>2025-06-18 basic/lifecycle</code>.</p>
+  <table>
+    <tr><th>Level</th><th>Requirement</th><th>Section</th></tr>
+    <tr><td>MUST</td><td>Initialization MUST be the first interaction between client and server.</td><td>Initialization</td></tr>
+    <tr><td>MUST</td><td>Client MUST send an <code>initialize</code> request with <code>protocolVersion</code>, <code>capabilities</code>, <code>clientInfo</code>.</td><td>Initialization</td></tr>
+    <tr><td>MUST</td><td>Server MUST respond with <code>protocolVersion</code>, <code>capabilities</code>, <code>serverInfo</code>.</td><td>Initialization</td></tr>
+    <tr><td>MUST</td><td>After successful init, client MUST send <code>notifications/initialized</code>.</td><td>Initialization</td></tr>
+    <tr><td>SHOULD NOT</td><td>Client SHOULD NOT send non-ping requests before the server responds to <code>initialize</code>.</td><td>Initialization</td></tr>
+    <tr><td>SHOULD NOT</td><td>Server SHOULD NOT send requests other than ping/logging before receiving <code>notifications/initialized</code>.</td><td>Initialization</td></tr>
+    <tr><td>MUST</td><td>Client MUST send a protocol version it supports; SHOULD be the latest it supports.</td><td>Version Negotiation</td></tr>
+    <tr><td>MUST</td><td>If the server supports the requested version, it MUST respond with the <strong>same</strong> version.</td><td>Version Negotiation</td></tr>
+    <tr><td>MUST</td><td>If not supported, the server MUST respond with another version it supports (SHOULD be its latest).</td><td>Version Negotiation</td></tr>
+    <tr><td>SHOULD</td><td>If the client does not support the server's returned version, it SHOULD disconnect.</td><td>Version Negotiation</td></tr>
+    <tr><td>MUST</td><td>Both parties MUST respect the negotiated version during Operation.</td><td>Operation</td></tr>
+    <tr><td>MUST</td><td>Both parties MUST only use capabilities that were successfully negotiated.</td><td>Operation</td></tr>
+    <tr><td>SHOULD</td><td>(stdio) Client shutdown: close stdin &rarr; wait/SIGTERM &rarr; wait/SIGKILL.</td><td>Shutdown &sect; stdio</td></tr>
+    <tr><td>MAY</td><td>Server MAY initiate shutdown by closing stdout and exiting.</td><td>Shutdown &sect; stdio</td></tr>
+  </table>
+  <p>Version change <code>2024-11-05 &rarr; 2025-06-18</code>: respecting the negotiated version
+  and using only negotiated capabilities was <strong>upgraded SHOULD &rarr; MUST</strong>.</p>
+</section>
+
+<section>
+  <h2>B. JSON-RPC 2.0 Conformance</h2>
+  <p>Source: <code>2025-06-18 basic/index</code> &sect; Messages; <code>schema.ts</code>.</p>
+  <table>
+    <tr><th>Level</th><th>Requirement</th></tr>
+    <tr><td>MUST</td><td>All messages MUST follow JSON-RPC 2.0.</td></tr>
+    <tr><td>MUST</td><td>Requests MUST include a string or integer id.</td></tr>
+    <tr><td>MUST NOT</td><td>The request id MUST NOT be <code>null</code>.</td></tr>
+    <tr><td>MUST NOT</td><td>The request id MUST NOT have been previously used by the requestor within the same session.</td></tr>
+    <tr><td>MUST</td><td>Responses MUST echo the same id as their request.</td></tr>
+    <tr><td>MUST</td><td>A response MUST set exactly one of <code>result</code> / <code>error</code>, never both.</td></tr>
+    <tr><td>MUST</td><td>Error codes MUST be integers.</td></tr>
+    <tr><td>MUST NOT</td><td>Notifications MUST NOT include an id.</td></tr>
+    <tr><td>MUST NOT</td><td>Receivers MUST NOT send a response to a notification.</td></tr>
+  </table>
+  <p>Reserved error codes (<code>schema.ts</code>):</p>
+  <table>
+    <tr><th>Code</th><th>Constant</th><th>Meaning</th></tr>
+    <tr><td><code>-32700</code></td><td>PARSE_ERROR</td><td>Invalid JSON received.</td></tr>
+    <tr><td><code>-32600</code></td><td>INVALID_REQUEST</td><td>JSON is not a valid Request object.</td></tr>
+    <tr><td><code>-32601</code></td><td>METHOD_NOT_FOUND</td><td>Method does not exist / is unavailable.</td></tr>
+    <tr><td><code>-32602</code></td><td>INVALID_PARAMS</td><td>Invalid method parameters.</td></tr>
+    <tr><td><code>-32603</code></td><td>INTERNAL_ERROR</td><td>Internal JSON-RPC error.</td></tr>
+  </table>
+  <p><strong>Batch removed:</strong> 2025-06-18 defines <code>JSONRPCMessage</code> as a union of single
+  request / notification / response / error only. No array/batch form exists; a
+  proxy must not emit or coalesce batch arrays.</p>
+</section>
+
+<section>
+  <h2>C. Request Lifetime (Timeouts)</h2>
+  <p>Source: <code>2025-06-18 basic/lifecycle</code> &sect; Timeouts.</p>
+  <table>
+    <tr><th>Level</th><th>Requirement</th></tr>
+    <tr><td>SHOULD</td><td>Establish a timeout for all sent requests.</td></tr>
+    <tr><td>SHOULD</td><td>On timeout, issue <code>notifications/cancelled</code> for that request and stop waiting.</td></tr>
+    <tr><td>SHOULD</td><td>Allow timeouts to be configured per request.</td></tr>
+    <tr><td>MAY</td><td>Reset the timeout clock on receiving a <code>notifications/progress</code> for the request.</td></tr>
+    <tr><td>SHOULD</td><td>Always enforce a maximum timeout regardless of progress, to cap a misbehaving peer.</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>D. Cancellation</h2>
+  <p>Source: <code>2025-06-18 basic/utilities/cancellation</code>.</p>
+  <table>
+    <tr><th>Level</th><th>Requirement</th></tr>
+    <tr><td>MUST</td><td>Cancellation MUST reference a request previously issued in the <strong>same direction</strong> and believed in-progress.</td></tr>
+    <tr><td>MUST NOT</td><td>The <code>initialize</code> request MUST NOT be cancelled by clients.</td></tr>
+    <tr><td>SHOULD</td><td>Receiver SHOULD stop processing, free resources, and send no response for the cancelled request.</td></tr>
+    <tr><td>MAY</td><td>Receiver MAY ignore a cancel for an unknown / completed / non-cancellable request.</td></tr>
+    <tr><td>SHOULD</td><td>Sender SHOULD ignore any response that arrives after it sent the cancel.</td></tr>
+    <tr><td>MUST</td><td>Both parties MUST handle the race where cancel arrives after the response was sent.</td></tr>
+    <tr><td>SHOULD</td><td>Invalid cancellations (unknown id, already done, malformed) SHOULD be ignored.</td></tr>
+  </table>
+  <pre>{ "method": "notifications/cancelled",
+  "params": { "requestId": "123", "reason": "User requested cancellation" } }</pre>
+  <p><code>requestId</code> is <code>RequestId = string | number</code> (schema.ts <code>CancelledNotification</code>).</p>
+</section>
+
+<section>
+  <h2>E. Progress</h2>
+  <p>Source: <code>2025-06-18 basic/utilities/progress</code>.</p>
+  <table>
+    <tr><th>Level</th><th>Requirement</th></tr>
+    <tr><td>MUST</td><td>Progress tokens MUST be a string or integer (<code>ProgressToken = string | number</code>).</td></tr>
+    <tr><td>MUST</td><td>Progress tokens MUST be unique across all active requests.</td></tr>
+    <tr><td>MUST</td><td>The <code>progress</code> value MUST increase with each notification, even if total is unknown.</td></tr>
+    <tr><td>MUST</td><td>Progress notifications MUST only reference tokens from an active, in-progress request.</td></tr>
+    <tr><td>MUST</td><td>Progress notifications MUST stop after completion.</td></tr>
+    <tr><td>SHOULD</td><td>Both parties SHOULD track active tokens and rate-limit to prevent flooding.</td></tr>
+  </table>
+  <p>Token location: <code>params._meta.progressToken</code> of the request (schema.ts <code>Request</code>).</p>
+  <pre>{ "method": "notifications/progress",
+  "params": { "progressToken": "abc", "progress": 1, "total": 10, "message": "..." } }</pre>
+</section>
+
+<section>
+  <h2>F. Ping</h2>
+  <p>Source: <code>2025-06-18 basic/utilities/ping</code>.</p>
+  <table>
+    <tr><th>Level</th><th>Requirement</th></tr>
+    <tr><td>MUST</td><td>The receiver MUST respond promptly with an empty result <code>{}</code>.</td></tr>
+    <tr><td>SHOULD</td><td>Periodically issue pings to detect connection health; frequency SHOULD be configurable.</td></tr>
+    <tr><td>SHOULD</td><td>Avoid excessive pinging; treat ping timeouts as connection failures.</td></tr>
+  </table>
+  <pre>req:  { "id": "123", "method": "ping" }
+resp: { "id": "123", "result": {} }</pre>
+</section>
+
+<section>
+  <h2>G. Transport &mdash; stdio</h2>
+  <p>Source: <code>2025-06-18 basic/transports</code> &sect; stdio.</p>
+  <table>
+    <tr><th>Level</th><th>Requirement</th></tr>
+    <tr><td>MUST</td><td>JSON-RPC messages MUST be UTF-8 encoded.</td></tr>
+    <tr><td>MUST NOT</td><td>Messages MUST NOT contain embedded newlines (they are newline-delimited).</td></tr>
+    <tr><td>MUST NOT</td><td>The server MUST NOT write non-MCP content to <code>stdout</code>.</td></tr>
+    <tr><td>MUST NOT</td><td>The client MUST NOT write non-MCP content to the server's <code>stdin</code>.</td></tr>
+    <tr><td>MAY</td><td>The server MAY write UTF-8 logs to <code>stderr</code>; clients MAY capture/forward/ignore them.</td></tr>
+    <tr><td>SHOULD</td><td>Client shutdown sequence: close stdin &rarr; SIGTERM &rarr; SIGKILL.</td></tr>
+    <tr><td>SHOULD NOT</td><td>Disconnection SHOULD NOT be interpreted as cancellation; cancel requires an explicit <code>notifications/cancelled</code>.</td></tr>
+  </table>
+  <p>The explicit "disconnect is not cancellation" wording sits in the Streamable HTTP
+  section; the same principle holds for stdio because cancellation requires an
+  explicit notification.</p>
+</section>
+
+<section>
+  <h2>H. Capabilities &amp; Feature Gating</h2>
+  <p>Source: <code>2025-06-18 basic/lifecycle</code> &sect; Capability Negotiation; <code>server/*</code>.</p>
+  <table>
+    <tr><th>Level</th><th>Requirement</th></tr>
+    <tr><td>MUST</td><td>Both parties MUST only use successfully negotiated capabilities.</td></tr>
+    <tr><td>MUST</td><td>Servers that support tools MUST declare the <code>tools</code> capability.</td></tr>
+    <tr><td>SHOULD</td><td>A server declaring <code>listChanged</code> SHOULD send the matching <code>*/list_changed</code> notification on change.</td></tr>
+  </table>
+  <p>Gating map: <code>tools.listChanged</code>, <code>prompts.listChanged</code>,
+  <code>resources.listChanged</code> each gate their <code>list_changed</code> notification;
+  <code>resources.subscribe</code> gates <code>resources/subscribe</code> and
+  <code>notifications/resources/updated</code>.</p>
+  <p>The resources capability has one list-change signal:
+  <code>notifications/resources/list_changed</code>. Because both
+  <code>resources/list</code> and <code>resources/templates/list</code> are discovery views of
+  that capability, the wrapper refreshes both views when this signal arrives. There is
+  no <code>notifications/resources/templates/list_changed</code> method in the MCP schema.</p>
+  <p><strong>Proxy clarification:</strong> "only negotiated capabilities" governs the
+  <em>backend's</em> capabilities. A proxy declaring a capability it <em>owns and fully
+  implements itself</em> (e.g. the wrapper's own control tool) is permitted &mdash; the spec
+  allows a party to offer a capability it implements. Misrepresenting the backend's
+  capabilities (advertising what the backend lacks, or suppressing what it declared)
+  is the violation, not owning a self-implemented one.</p>
+</section>
+
+<section>
+  <h2>I. Pagination</h2>
+  <p>Source: <code>2025-06-18 server/utilities/pagination</code>.</p>
+  <table>
+    <tr><th>Level</th><th>Requirement</th></tr>
+    <tr><td>MUST</td><td>Clients MUST treat cursors as opaque: do not parse or modify.</td></tr>
+    <tr><td>MUST NOT</td><td>Clients MUST NOT assume a fixed page size.</td></tr>
+    <tr><td>MUST NOT</td><td>Clients MUST NOT persist cursors across sessions.</td></tr>
+    <tr><td>SHOULD</td><td>Servers SHOULD provide stable cursors and handle invalid cursors gracefully.</td></tr>
+    <tr><td>SHOULD</td><td>A missing <code>nextCursor</code> SHOULD be treated as end of results; support paginated and non-paginated flows.</td></tr>
+    <tr><td>SHOULD</td><td>Invalid cursor SHOULD return <code>-32602</code> (invalid params).</td></tr>
+  </table>
+  <p>Paginated operations: <code>resources/list</code>, <code>resources/templates/list</code>,
+  <code>prompts/list</code>, <code>tools/list</code>. <code>Cursor = string</code> (opaque).</p>
+</section>
+
+<section>
+  <h2>J. <code>_meta</code> &amp; Reserved Key Names</h2>
+  <p>Source: <code>2025-06-18 basic/index</code> &sect; General fields &sect; <code>_meta</code>.</p>
+  <p>A valid <code>_meta</code> key has an optional <strong>prefix</strong> and a <strong>name</strong>.</p>
+  <ul>
+    <li><strong>Prefix</strong> (if present): a series of dot-separated labels followed by a
+    slash (<code>/</code>). Labels start with a letter, end with a letter or digit; interior
+    chars may be letters, digits, hyphens.</li>
+    <li><strong>Reserved:</strong> any prefix whose label sequence contains
+    <code>modelcontextprotocol</code> or <code>mcp</code> as a label segment is reserved for MCP. Examples:
+    <code>modelcontextprotocol.io/</code>, <code>mcp.dev/</code>, <code>api.modelcontextprotocol.org/</code>,
+    <code>tools.mcp.com/</code>.</li>
+    <li><strong>Name:</strong> unless empty, MUST begin and end with an alphanumeric
+    character; may contain hyphens, underscores, dots, alphanumerics between.</li>
+  </ul>
+  <p><strong>Critical scope distinction.</strong> The reserved-prefix rule applies <em>only to
+  keys inside the <code>_meta</code> object</em>. The spec imposes <strong>no</strong> reserved-name or
+  naming-pattern restriction on <strong>tool names</strong>, method names, or other
+  identifiers. The <code>Tool.name</code> field is typed <code>string</code> with no pattern. A wrapper
+  tool name such as <code>mcp.wrapper</code> is therefore unrestricted and compliant. A bare
+  <code>_meta</code> key with no slash (e.g. <code>mcpWrapper</code>) is a <em>name</em>, not a <em>prefix</em>, so
+  the reserved-prefix rule does not apply to it either.</p>
+</section>
+
+<section>
+  <h2>Tool Result Shape</h2>
+  <p>Source: <code>2025-06-18 server/tools</code>; <code>schema.ts CallToolResult</code>.</p>
+  <ul>
+    <li><code>content: ContentBlock[]</code> &mdash; text / image / audio / resource link / embedded resource.</li>
+    <li><code>structuredContent?</code> &mdash; optional structured JSON (new in 2025-06-18).</li>
+    <li><code>isError?: boolean</code> &mdash; tool-level errors go here as <code>true</code>; absent means success.</li>
+  </ul>
+  <p>Error split: errors <em>from the tool</em> (API failure, bad input) SHOULD be returned
+  inside the result with <code>isError:true</code>. Errors in <em>finding/dispatching</em> the tool
+  (unknown tool, unsupported call) SHOULD be a JSON-RPC protocol error. If a tool
+  declares <code>outputSchema</code>, the server MUST return conforming structured results, and
+  SHOULD also serialize them into a TextContent block for backward compatibility.</p>
+</section>
+
+<section>
+  <h2>Proxy Obligations Summary</h2>
+  <p>A transparent stdio proxy between an MCP client and server must preserve these
+  invariants:</p>
+  <table>
+    <tr><th>Invariant</th><th>Obligation</th></tr>
+    <tr><td>Request id</td><td>Remap outbound ids consistently and restore the caller's id on response; never reuse an id within a session/direction.</td></tr>
+    <tr><td><code>_meta</code> passthrough</td><td>Forward <code>_meta</code> unmodified both directions, including <code>progressToken</code> &mdash; stripping it breaks progress routing.</td></tr>
+    <tr><td><code>protocolVersion</code></td><td>Forward verbatim in <code>initialize</code> request and response; do not substitute a preferred version.</td></tr>
+    <tr><td>Capabilities</td><td>Do not advertise what the backend lacks nor suppress what it declares; a self-owned, self-implemented capability is allowed.</td></tr>
+    <tr><td>Cancellation</td><td>Translate <code>requestId</code> through the id remap; keep it direction-matched; never forward a cancel for a request not issued in that direction; never cancel <code>initialize</code>.</td></tr>
+    <tr><td>Notifications / responses</td><td>Never reply to a notification; absorb accidental echoes.</td></tr>
+    <tr><td>stdio framing</td><td>UTF-8, newline-delimited, no embedded newlines; nothing non-MCP on stdout either direction.</td></tr>
+    <tr><td>Disconnect</td><td>Do not convert a disconnect into a cancellation; require an explicit <code>notifications/cancelled</code>.</td></tr>
+  </table>
+</section>
+
+</main></body></html>

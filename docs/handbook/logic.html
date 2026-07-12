@@ -7,7 +7,8 @@
   <h2>Transitions</h2>
   <table>
     <tr><th>Decision</th><th>Rule owner</th><th>Result</th></tr>
-    <tr><td>Method route</td><td><a href="../../src/mcp_interface.rs">mcp_interface.rs</a></td><td>Cache, local ping, wrapper control, or pass-through.</td></tr>
+    <tr><td>Event-plane route</td><td><a href="../../src/event_plane.rs">event_plane.rs</a></td><td>Resolve JSON-RPC direction/kind/method/selector to a mounted program id; unknown future events pass through.</td></tr>
+    <tr><td>Method route projection</td><td><a href="../../src/mcp_interface.rs">mcp_interface.rs</a></td><td>Project the event-plane program into cache, local ping, wrapper control, or pass-through execution.</td></tr>
     <tr><td>Capability support</td><td><a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td>Query supported list method or cache empty result.</td></tr>
     <tr><td><code>mcp.wrapper</code> action route</td><td><a href="../../src/tools/mod.rs">src/tools</a></td><td>Validate action, target, and params; call a tools object method through the current runtime or broker context.</td></tr>
     <tr><td>Multi-backend tool route</td><td>future supervisor registry owner</td><td>Resolve tool name from a rebuilt route table; return structured stale or ambiguous route error instead of guessing at call time.</td></tr>
@@ -15,11 +16,13 @@
     <tr><td>Backend hook/observe control</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a> and <a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td>Observe state, restart or refresh through local hooks, increment generation/cache epoch, then publish readback evidence.</td></tr>
     <tr><td>Backend spawn storm</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td>After repeated spawn failures, enter degraded cooldown; only forced restart may bypass the cooldown.</td></tr>
     <tr><td>Backend peer request</td><td><a href="../../src/runtime_manager.rs">runtime_manager.rs</a> and <a href="../../src/broker_manager.rs">broker_manager.rs</a></td><td>Relay only through the active request scope; broker mode rejects unassociated backend requests.</td></tr>
+    <tr><td>Request lifetime</td><td><a href="../../src/lifetime.rs">lifetime.rs</a> and <a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td>Translate IDs, validate progress tokens, cancel pending backend channel senders, discard late responses, and keep daemon peer traffic in the owning session.</td></tr>
+    <tr><td>Cache correctness</td><td><a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td>Initialize backend with today's protocol date, drain backend pagination into complete cached list views, and reject frontend cursors that the wrapper did not issue.</td></tr>
     <tr><td>Daemon coordination</td><td><a href="../../src/daemon_manager.rs">daemon_manager.rs</a></td><td>Connect existing broker or spawn one under lock.</td></tr>
   </table>
 </section>
 <section>
   <h2>Invariants</h2>
-  <p>Route decisions stay pure. Backend request IDs are internal and must be restored before the client sees the response. Process groups are killed explicitly before runtime exit. <code>mcp.wrapper</code> actions must not pass through to backend tools and must not mutate lifecycle or cache state except by calling the existing owner APIs. Future multi-backend routing must use a registry-owned route table; string guessing at call time is illegal. Hook/observe control must not treat arbitrary notifications as lifecycle truth. Peer responses must be forwarded without holding the backend slot mutex that protects lifecycle state. Spawn failures must become observable degraded state instead of repeated blind respawn attempts.</p>
+  <p>Route decisions stay pure and originate in the event-plane mount table. Backend request IDs are internal and must be restored before the client sees the response. Process groups are killed explicitly before runtime exit. <code>mcp.wrapper</code> actions must not pass through to backend tools and must not mutate lifecycle or cache state except by calling the existing owner APIs. Future multi-backend routing must use a registry-owned route table; string guessing at call time is illegal. Hook/observe control must not treat arbitrary notifications as lifecycle truth. Peer responses must be forwarded without holding the backend slot mutex that protects lifecycle state. Spawn failures must become observable degraded state instead of repeated blind respawn attempts. Progress and cancel notifications must match an active request in the same direction/session before they cross the wrapper.</p>
 </section>
 </main></body></html>

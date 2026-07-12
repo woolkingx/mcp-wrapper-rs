@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::timeouts;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliMode {
     Version,
@@ -101,7 +103,7 @@ pub fn parse(args: Vec<String>) -> Result<CliMode, CliError> {
 
 fn parse_proxy(args: &[String]) -> Result<CliMode, CliError> {
     let mut daemon = false;
-    let mut init_timeout = Duration::from_secs(30);
+    let mut init_timeout = timeouts::default_init_timeout();
     let mut index = 1;
 
     while index < args.len() {
@@ -171,7 +173,7 @@ fn parse_admin(args: &[String]) -> Result<CliMode, CliError> {
     let mut output_json = false;
     let mut start = false;
     let mut force = false;
-    let mut init_timeout = Duration::from_secs(30);
+    let mut init_timeout = timeouts::default_init_timeout();
     let mut separator = None;
 
     while index < args.len() {

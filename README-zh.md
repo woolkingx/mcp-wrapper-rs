@@ -41,15 +41,15 @@ python3 server.py           ~50MB
 
 產品由四個概念定義：
 
-- **Cache-first 閒置經濟**。穩定的探索資料（`initialize`、`tools/list`、`prompts/list`、`resources/list`）只擷取一次並從記憶體服務。後端採惰性啟動——只在真正需要動態呼叫（`tools/call`、`resources/read`…）時才 spawn——所以閒置的 wrapper 幾乎不耗資源。對外服務的 `tools/list` / `initialize` 視圖是 **hold-state**：只在後端資料載入或刷新時重建，不在每次讀取時重算。
+- **Cache-first 閒置經濟**。穩定的探索資料（`initialize`、`tools/list`、`prompts/list`、`resources/list`）只擷取一次並從記憶體服務。後端採惰性啟動——只在真正需要動態呼叫（`tools/call`、`resources/read`…）時才 spawn——所以閒置的 wrapper 幾乎不耗資源。對外服務的 `tools/list` / `initialize` 視圖是 **hold-state**：只在後端資料載入或刷新時重建，不在每次讀取時重算。每次 refresh 先把所有指定探索結果驗證成單一 candidate，再原子替換 committed snapshot；錯誤、過期 revision 或 backend generation 改變都保留上一份真相。
 
 - **唯一統一控制面：`mcp.wrapper`**。wrapper 在 `tools/list` 注入唯一保留工具 `mcp.wrapper`。後端 status、ping、刷新探索、restart、stop 全部是這個工具上的 `action`。Admin CLI 與 MCP 客戶端投影到**同一份** action schema 與結果信封——沒有第二條控制路徑。後端若試圖註冊這個保留名稱，無法覆蓋它。
 
-- **Owner-local 生命週期**。每塊狀態只有一個 owner。`BackendSlot` 擁有後端行程——alive 判定、restart/stop 轉移、以及 active-call 安全不變式（有呼叫進行中時拒絕 stop 與非強制 restart）。`Cache` 擁有探索資料與對外視圖的生命週期。`tools` 是對外入口與分派層，擁有 action schema 與信封，但**不**持有任何生命週期狀態——它把 action 路由到 owner method。驗證內化在 invocation 物件本身，而非獨立 validator。
+- **Owner-local 生命週期**。每塊狀態只有一個 owner。`BackendSlot` 擁有後端行程的 alive 判定與 restart/stop 轉移；`RequestLifetime` 以 session-aware request row 擁有請求 identity，並由這些 row 推導 active-call 狀態，因此 cancellation、completion 與 backend generation 不會跨 client 混淆。`Cache` 擁有探索資料與對外視圖的生命週期。`tools` 是對外入口與分派層，擁有 action schema 與信封，但**不**持有任何生命週期狀態——它把 action 路由到 owner method。驗證內化在 invocation 物件本身，而非獨立 validator。
 
 - **Observe → hook → readback 控制面**。後端事實（行程結束、`listChanged`、降級冷卻）是訊號而非真相。控制動作透過 owner 請求一個合法轉移；新狀態在任何客戶端、log、CLI 或工具投影宣告前，先由 readback 快照證明。狀態是證據，不是附在指令上的期望。
 
-在 **daemon 模式**下，單一 broker 擁有共享的 backend/cache 配對並 fan-out 給多個客戶端 session；active-call 安全計數是 broker 全域的，所以任一 session 都無法在另一個 session 有工作進行中時 stop 或 restart 共享後端。
+在 **daemon 模式**下，單一 broker 擁有共享的 backend/cache 配對並 fan-out 給多個客戶端 session。Client identity 使用 `(session_id, client_request_id)` 複合鍵，而不是 process-global JSON-RPC ID；broker 再將它 join 到 backend request identity 與 generation。Active-call 安全由仍存活的 request row 推導，所以一個 session 不能取消另一個 session 的請求，也不能在尚有工作進行時 stop 或 restart 共享後端。
 
 ### 補足官方 stdio MCP 的不足
 

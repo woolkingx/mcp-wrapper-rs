@@ -40,7 +40,8 @@ impl ObjectTree {
             Value::Object(map) => {
                 let mut out = BTreeMap::new();
                 for (k, v) in map {
-                    let sub_schema = sub_schema_for_key_from(schema.as_deref(), root.as_deref(), &k);
+                    let sub_schema =
+                        sub_schema_for_key_from(schema.as_deref(), root.as_deref(), &k);
                     out.insert(k, ObjectTree::from_value(v, sub_schema, root.clone()));
                 }
                 Node::Object(out)
@@ -48,7 +49,8 @@ impl ObjectTree {
             Value::Array(arr) => {
                 let mut out = Vec::with_capacity(arr.len());
                 for (idx, v) in arr.into_iter().enumerate() {
-                    let sub_schema = sub_schema_for_index_from(schema.as_deref(), root.as_deref(), idx);
+                    let sub_schema =
+                        sub_schema_for_index_from(schema.as_deref(), root.as_deref(), idx);
                     out.push(ObjectTree::from_value(v, sub_schema, root.clone()));
                 }
                 Node::Array(out)
@@ -88,8 +90,12 @@ impl ObjectTree {
     /// Return x-* extensions from schema (optionally by dot path).
     pub fn get_extensions(&self, path: Option<&str>) -> BTreeMap<String, Value> {
         let mut out = BTreeMap::new();
-        let Some(node) = self.get_schema(path) else { return out };
-        let Some(obj) = node.as_object() else { return out };
+        let Some(node) = self.get_schema(path) else {
+            return out;
+        };
+        let Some(obj) = node.as_object() else {
+            return out;
+        };
         for (k, v) in obj {
             if k.starts_with("x-") {
                 out.insert(k.clone(), v.clone());
@@ -183,9 +189,15 @@ impl ObjectTree {
 
         if let Some(sub) = sub_schema_for_key_from(schema.as_deref(), root.as_deref(), key) {
             super::validate::check_field(key, &sub, &value, root.as_deref())?;
-            map.insert(key.to_string(), ObjectTree::from_value(value, Some(sub), root.clone()));
+            map.insert(
+                key.to_string(),
+                ObjectTree::from_value(value, Some(sub), root.clone()),
+            );
         } else {
-            map.insert(key.to_string(), ObjectTree::from_value(value, None, root.clone()));
+            map.insert(
+                key.to_string(),
+                ObjectTree::from_value(value, None, root.clone()),
+            );
         }
         Ok(())
     }
@@ -217,7 +229,9 @@ impl ObjectTree {
 
     /// Apply default values from schema, returning a new ObjectTree.
     pub fn with_defaults(self) -> Self {
-        let Some(schema) = &self.schema else { return self };
+        let Some(schema) = &self.schema else {
+            return self;
+        };
         let mut data = self.to_value();
         super::defaults::apply_defaults(&mut data, schema.as_ref());
         ObjectTree::from_value(data, Some(schema.clone()), self.root.clone())
@@ -229,7 +243,8 @@ impl ObjectTree {
             Some(s) => s,
             None => return Ok(()),
         };
-        super::validate::check_value_with_root(schema, &self.to_value(), self.root_schema()).map_err(|e| vec![e])
+        super::validate::check_value_with_root(schema, &self.to_value(), self.root_schema())
+            .map_err(|e| vec![e])
     }
 
     // --- Access ---
@@ -293,7 +308,11 @@ impl ObjectTree {
     /// Iterate over object entries as `(key, ObjectTree)` pairs.
     pub fn entries(&self) -> impl Iterator<Item = (&str, &ObjectTree)> {
         match &self.node {
-            Node::Object(map) => map.iter().map(|(k, v)| (k.as_str(), v)).collect::<Vec<_>>().into_iter(),
+            Node::Object(map) => map
+                .iter()
+                .map(|(k, v)| (k.as_str(), v))
+                .collect::<Vec<_>>()
+                .into_iter(),
             _ => Vec::new().into_iter(),
         }
     }
@@ -344,11 +363,14 @@ impl ObjectTree {
             }
         }
     }
-
 }
 
 /// Free function for sub-schema extraction (used by iterators that can't borrow self).
-fn sub_schema_for_key_from(schema: Option<&Value>, root: Option<&Value>, key: &str) -> Option<Arc<Value>> {
+fn sub_schema_for_key_from(
+    schema: Option<&Value>,
+    root: Option<&Value>,
+    key: &str,
+) -> Option<Arc<Value>> {
     let schema = schema?;
     let schema = super::validate::resolve_ref_if_needed(schema, root)?;
     if let Some(prop_schema) = schema
@@ -375,7 +397,11 @@ fn sub_schema_for_key_from(schema: Option<&Value>, root: Option<&Value>, key: &s
     None
 }
 
-fn sub_schema_for_index_from(schema: Option<&Value>, root: Option<&Value>, idx: usize) -> Option<Arc<Value>> {
+fn sub_schema_for_index_from(
+    schema: Option<&Value>,
+    root: Option<&Value>,
+    idx: usize,
+) -> Option<Arc<Value>> {
     let schema = schema?;
     let schema = super::validate::resolve_ref_if_needed(schema, root)?;
     let items = schema.get("items")?;

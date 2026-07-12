@@ -5,6 +5,8 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::debug;
 
+use crate::event_plane;
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum JsonRpcMessage {
@@ -136,6 +138,8 @@ pub fn build_notification(method: &str, params: Option<Value>) -> Value {
 }
 
 pub mod error_codes {
+    pub const INVALID_REQUEST: i64 = -32600;
+    pub const INVALID_PARAMS: i64 = -32602;
     pub const INTERNAL_ERROR: i64 = -32603;
 }
 
@@ -166,33 +170,7 @@ pub enum WrapperControlMethod {
 }
 
 pub fn route(method: &str) -> Route {
-    match method {
-        "initialize" => Route::McpData(McpDataKey::Initialize),
-        "tools/list" => Route::McpData(McpDataKey::ToolsList),
-        "prompts/list" => Route::McpData(McpDataKey::PromptsList),
-        "resources/list" => Route::McpData(McpDataKey::ResourcesList),
-        "resources/templates/list" => Route::McpData(McpDataKey::ResourceTemplatesList),
-        "ping" => Route::Local,
-        "mcp-wrapper/backend/status" => Route::WrapperControl(WrapperControlMethod::BackendStatus),
-        "mcp-wrapper/backend/refresh" => {
-            Route::WrapperControl(WrapperControlMethod::BackendRefresh)
-        }
-        "mcp-wrapper/backend/restart" => {
-            Route::WrapperControl(WrapperControlMethod::BackendRestart)
-        }
-        "mcp-wrapper/backend/stop" => Route::WrapperControl(WrapperControlMethod::BackendStop),
-        "mcp-wrapper/backend/ping" => Route::WrapperControl(WrapperControlMethod::BackendPing),
-        _ => Route::PassThrough,
-    }
-}
-
-pub fn is_list_changed_notification(method: &str) -> Option<McpDataKey> {
-    match method {
-        "notifications/tools/list_changed" => Some(McpDataKey::ToolsList),
-        "notifications/prompts/list_changed" => Some(McpDataKey::PromptsList),
-        "notifications/resources/list_changed" => Some(McpDataKey::ResourcesList),
-        _ => None,
-    }
+    event_plane::route_for_client_request(method)
 }
 
 pub fn method_for_mcp_data_key(key: &McpDataKey) -> &'static str {

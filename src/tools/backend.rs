@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use serde_json::{json, Value};
 
 use crate::backend_manager::BackendSlot;
@@ -43,21 +41,25 @@ async fn ping(invocation: ToolInvocation, context: InvocationContext<'_>) -> Val
 }
 
 async fn refresh(invocation: ToolInvocation, context: InvocationContext<'_>) -> Value {
-    let be = match context.backend_slot.live().await {
-        Some(be) => be,
-        None => {
+    if context.backend_slot.live().await.is_none() {
+        return error_envelope(
+            invocation.action.name(),
+            &invocation.target,
+            "backendUnavailable",
+            "backend unavailable for refresh",
+        );
+    }
+    let report = match context.cache.refresh_all(context.backend_slot).await {
+        Ok(report) => report,
+        Err(error) => {
             return error_envelope(
                 invocation.action.name(),
                 &invocation.target,
-                "backendUnavailable",
-                "backend unavailable for refresh",
+                "cacheRefresh",
+                &error,
             );
         }
     };
-    let report = context
-        .cache
-        .refresh_all(&be, context.backend_slot.generation())
-        .await;
     ok_envelope(
         invocation.action.name(),
         &invocation.target,
@@ -71,10 +73,7 @@ async fn restart(invocation: ToolInvocation, context: InvocationContext<'_>) -> 
         .get("force")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if BackendSlot::restart_blocked_by_active_calls(
-        context.active_calls.load(Ordering::Acquire),
-        force,
-    ) {
+    if BackendSlot::restart_blocked_by_active_calls(context.active_calls, force) {
         return error_envelope(
             invocation.action.name(),
             &invocation.target,
@@ -91,21 +90,25 @@ async fn restart(invocation: ToolInvocation, context: InvocationContext<'_>) -> 
             &e,
         );
     }
-    let be = match context.backend_slot.live().await {
-        Some(be) => be,
-        None => {
+    if context.backend_slot.live().await.is_none() {
+        return error_envelope(
+            invocation.action.name(),
+            &invocation.target,
+            "backendUnavailable",
+            "backend unavailable after restart",
+        );
+    }
+    let report = match context.cache.refresh_all(context.backend_slot).await {
+        Ok(report) => report,
+        Err(error) => {
             return error_envelope(
                 invocation.action.name(),
                 &invocation.target,
-                "backendUnavailable",
-                "backend unavailable after restart",
+                "cacheRefresh",
+                &error,
             );
         }
     };
-    let report = context
-        .cache
-        .refresh_all(&be, context.backend_slot.generation())
-        .await;
     ok_envelope(
         invocation.action.name(),
         &invocation.target,
@@ -114,7 +117,7 @@ async fn restart(invocation: ToolInvocation, context: InvocationContext<'_>) -> 
 }
 
 async fn stop(invocation: ToolInvocation, context: InvocationContext<'_>) -> Value {
-    if BackendSlot::stop_blocked_by_active_calls(context.active_calls.load(Ordering::Acquire)) {
+    if BackendSlot::stop_blocked_by_active_calls(context.active_calls) {
         return error_envelope(
             invocation.action.name(),
             &invocation.target,

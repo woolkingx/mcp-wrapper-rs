@@ -17,15 +17,21 @@
     <tr><td>Supervisor backend spec: backend id, command, args, env projection, working directory, policy</td><td>future supervisor registry owner</td><td><code>GATE-REGISTRY-01</code></td></tr>
     <tr><td>Supervisor route table: backend tool name to backend id plus collision state</td><td>future supervisor registry owner</td><td><code>GATE-REGISTRY-01</code></td></tr>
     <tr><td>Wrapper backend hook method</td><td><a href="../../src/mcp_interface.rs">mcp_interface.rs</a></td><td><code>GATE-BACKEND-OBS-01</code></td></tr>
-    <tr><td>Backend state snapshot and MCP cache epoch</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a> and <a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td><code>GATE-BACKEND-OBS-01</code></td></tr>
+    <tr><td>Backend state snapshot and atomic MCP cache transaction</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a> and <a href="../../src/mcp_manager.rs">mcp_manager.rs</a></td><td><code>GATE-BACKEND-OBS-01</code></td></tr>
     <tr><td>Backend degraded cooldown fields</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td><code>GATE-BACKEND-OBS-01</code></td></tr>
     <tr><td>Typed backend observe event</td><td><a href="../../src/backend_manager.rs">backend_manager.rs</a></td><td><code>GATE-BACKEND-OBS-01</code></td></tr>
     <tr><td>Server-to-client peer request and client response</td><td><a href="../../src/runtime_manager.rs">runtime_manager.rs</a> and <a href="../../src/broker_manager.rs">broker_manager.rs</a></td><td><code>GATE-PROXY-01</code></td></tr>
+    <tr><td>Daemon client request identity</td><td><a href="../../src/lifetime.rs">lifetime.rs</a></td><td><code>GATE-PROXY-01</code></td></tr>
+    <tr><td>Daemon Session row: <code>session_id</code>, delivery channel, connection state</td><td><a href="../../src/broker_manager.rs">broker_manager.rs</a></td><td><code>GATE-PROXY-01</code></td></tr>
+    <tr><td>Daemon Request row: client key, backend id, progress token, state</td><td><a href="../../src/lifetime.rs">lifetime.rs</a></td><td><code>GATE-PROXY-01</code></td></tr>
+    <tr><td>Daemon PeerRequest row: <code>(session_id, raw_peer_id)</code>, progress token</td><td><a href="../../src/lifetime.rs">lifetime.rs</a></td><td><code>GATE-PROXY-01</code></td></tr>
     <tr><td>JSON-RPC response and error envelope</td><td><a href="../../tests/conformance.rs">conformance.rs</a></td><td><code>GATE-CACHE-01</code></td></tr>
   </table>
 </section>
 <section>
   <h2>Rule</h2>
   <p>New protocol shape support starts with route ownership and conformance proof. Hook responses must be local wrapper JSON-RPC results with stable fields for backend generation, cache epoch, state, and readback evidence. Wrapper tool shapes start in <code>src/tools</code>; CLI argv parsing and MCP <code>tools/call</code> parsing are projections of that schema, not independent schema owners.</p>
+  <p>Daemon request identity is the composite <code>(session_id, raw_client_id)</code>; a raw JSON-RPC id is unique only inside its session and cannot be used as a cross-session lookup or cancellation fallback. This is an internal ownership key and does not change the MCP wire schema.</p>
+  <p>N:1 runtime state is represented as owner rows plus indexes, not counters or a current-session pointer. The Request row is the active-call truth. Backend-id and progress-token maps are secondary indexes into that row and must be removed in the same terminal transition. PeerRequest identity is also session-complete; equal peer IDs and progress tokens may coexist in different sessions.</p>
 </section>
 </main></body></html>

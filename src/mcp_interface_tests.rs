@@ -1,6 +1,5 @@
 use crate::mcp_interface::{
-    McpDataKey, Route, WrapperControlMethod, is_list_changed_notification, method_for_mcp_data_key,
-    route,
+    method_for_mcp_data_key, route, McpDataKey, Route, WrapperControlMethod,
 };
 
 #[test]
@@ -60,24 +59,6 @@ fn passthrough_methods() {
     assert_eq!(route("resources/subscribe"), Route::PassThrough);
     assert_eq!(route("resources/unsubscribe"), Route::PassThrough);
     assert_eq!(route("some/future/method"), Route::PassThrough);
-}
-
-#[test]
-fn list_changed_notifications() {
-    assert_eq!(
-        is_list_changed_notification("notifications/tools/list_changed"),
-        Some(McpDataKey::ToolsList)
-    );
-    assert_eq!(
-        is_list_changed_notification("notifications/prompts/list_changed"),
-        Some(McpDataKey::PromptsList)
-    );
-    assert_eq!(
-        is_list_changed_notification("notifications/resources/list_changed"),
-        Some(McpDataKey::ResourcesList)
-    );
-    assert_eq!(is_list_changed_notification("notifications/other"), None);
-    assert_eq!(is_list_changed_notification("tools/call"), None);
 }
 
 #[test]

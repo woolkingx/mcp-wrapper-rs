@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 fn wrapper_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mcp-wrapper-rs"))
@@ -18,6 +18,9 @@ struct Wrapper {
     child: Child,
     stdin: std::process::ChildStdin,
     reader: BufReader<std::process::ChildStdout>,
+    backend_args: Vec<String>,
+    daemon: bool,
+    cleaned: bool,
 }
 
 impl Wrapper {
@@ -37,10 +40,14 @@ impl Wrapper {
         let mut child = cmd.spawn().expect("failed to spawn wrapper");
         let stdin = child.stdin.take().unwrap();
         let reader = BufReader::new(child.stdout.take().unwrap());
+        let daemon = extra_args.iter().any(|arg| *arg == "--daemon");
         Wrapper {
             child,
             stdin,
             reader,
+            backend_args: backend_args.iter().map(|arg| (*arg).to_string()).collect(),
+            daemon,
+            cleaned: false,
         }
     }
 
@@ -143,8 +150,30 @@ impl Wrapper {
     }
 
     fn kill(mut self) {
+        self.cleanup();
+    }
+
+    fn cleanup(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        self.cleaned = true;
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if self.daemon {
+            let mut cmd = Command::new(wrapper_binary());
+            cmd.args(["broker", "stop", "--json", "--"]);
+            cmd.arg("python3").arg(echo_server_path());
+            cmd.args(&self.backend_args);
+            let _ = cmd.output();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+    }
+}
+
+impl Drop for Wrapper {
+    fn drop(&mut self) {
+        self.cleanup();
     }
 }
 
@@ -248,6 +277,40 @@ fn backend_refresh_notifies_only_on_discovery_change() {
     );
 
     w.kill();
+}
+
+#[test]
+fn failed_multi_key_refresh_preserves_committed_snapshot() {
+    let mut w = Wrapper::spawn_with_backend_args(&[], &["--refresh-error-prompts"]);
+    w.handshake();
+
+    let before = w.status(2);
+    let before_epoch = before["result"]["mcp"]["cacheEpoch"].clone();
+    let before_hash = before["result"]["mcp"]["discoveryHash"].clone();
+
+    let refresh = w.refresh(3);
+    assert!(
+        refresh.get("error").is_some(),
+        "refresh must report failure: {refresh}"
+    );
+
+    let after = w.status(4);
+    assert_eq!(after["result"]["mcp"]["cacheEpoch"], before_epoch);
+    assert_eq!(after["result"]["mcp"]["discoveryHash"], before_hash);
+
+    w.send(&json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}));
+    let tools = w.recv();
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"echo"));
+    assert!(
+        !names.contains(&"echo-v2"),
+        "partial tools update leaked: {tools}"
+    );
 }
 
 #[test]
@@ -406,12 +469,10 @@ fn backend_circuit_breaker_rejects_spawn_storm_until_force_restart() {
     w.handshake();
 
     let first = w.call_echo(2, "will-fail");
-    assert!(
-        first["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("backend spawn failed after 3 attempts")
-    );
+    assert!(first["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("backend spawn failed after 3 attempts"));
 
     let degraded = w.status(3);
     assert_eq!(degraded["result"]["backend"]["state"], "degraded");
@@ -429,20 +490,16 @@ fn backend_circuit_breaker_rejects_spawn_storm_until_force_restart() {
         start.elapsed() < std::time::Duration::from_secs(1),
         "cooldown rejection should not run spawn backoff"
     );
-    assert!(
-        second["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("backend temporarily degraded")
-    );
+    assert!(second["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("backend temporarily degraded"));
 
     let restart = w.restart(5);
-    assert!(
-        restart["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("restart rejected during cooldown")
-    );
+    assert!(restart["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("restart rejected during cooldown"));
 
     let _ = std::fs::remove_file(&marker);
     let forced = w.restart_force(6);

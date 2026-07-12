@@ -4,15 +4,6 @@ use crate::tools::schema::{parse_invocation, to_call_tool_result, InvocationCont
 
 pub const WRAPPER_TOOL_NAME: &str = "mcp.wrapper";
 
-pub fn is_wrapper_tool_call(raw: &Value) -> bool {
-    raw.get("method").and_then(|v| v.as_str()) == Some("tools/call")
-        && raw
-            .get("params")
-            .and_then(|v| v.get("name"))
-            .and_then(|v| v.as_str())
-            == Some(WRAPPER_TOOL_NAME)
-}
-
 /// The declared `mcp.wrapper` schema. `ToolInvocation::from_arguments` /
 /// `ToolAction::validate_params` are its runtime projection — enum variants and
 /// the `force` type must match this descriptor. Built only when the cache

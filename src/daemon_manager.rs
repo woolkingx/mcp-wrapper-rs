@@ -21,7 +21,11 @@ fn read_alive_pid(pid_path: &std::path::Path) -> Option<u32> {
     let pid: u32 = content.trim().parse().ok()?;
     // kill(pid, 0) checks existence without sending a signal
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if result == 0 { Some(pid) } else { None }
+    if result == 0 {
+        Some(pid)
+    } else {
+        None
+    }
 }
 
 /// Paths used for daemon coordination.

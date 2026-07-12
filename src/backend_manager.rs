@@ -1,34 +1,93 @@
 //! Backend manager owner: child process lifecycle and process-group cleanup.
 
 use process_wrap::tokio::{CommandWrap, ProcessGroup};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::Command;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
-use crate::mcp_manager;
+use crate::{event_plane, mcp_manager};
 
 pub type ChildPgids = Arc<std::sync::Mutex<Vec<u32>>>;
 
-#[derive(Debug)]
+pub(crate) fn retain_utf8_tail(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+
+    let mut start = value.len() - max_bytes;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value.drain(..start);
+}
+
 pub enum BackendEvent {
-    Notification(serde_json::Value),
+    Notification(serde_json::Value, BackendEventAck),
     PeerRequest(serde_json::Value),
     UnmatchedResponse(serde_json::Value),
     ProcessExit,
 }
 
+pub struct BackendEventAck(Option<oneshot::Sender<()>>);
+
+impl BackendEventAck {
+    fn none() -> Self {
+        Self(None)
+    }
+
+    fn new(sender: oneshot::Sender<()>) -> Self {
+        Self(Some(sender))
+    }
+}
+
+impl Drop for BackendEventAck {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+struct PendingState {
+    pending: HashMap<serde_json::Value, oneshot::Sender<serde_json::Value>>,
+    discarded: HashSet<serde_json::Value>,
+    closed: bool,
+}
+
+impl PendingState {
+    fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+            discarded: HashSet::new(),
+            closed: false,
+        }
+    }
+
+    fn mark_discarding(&mut self, id: serde_json::Value) {
+        self.discarded.insert(id);
+    }
+}
+
+fn should_order_before_response(msg: &serde_json::Value) -> bool {
+    let Some(method) = msg.get("method").and_then(|m| m.as_str()) else {
+        return false;
+    };
+    event_plane::notification_program(event_plane::Dir::ServerToClient, method)
+        == Some(event_plane::EventProgramId::ProgressRequest)
+}
+
 pub struct Backend {
     child_stdin: Arc<Mutex<BufWriter<tokio::process::ChildStdin>>>,
-    pending: Arc<Mutex<HashMap<serde_json::Value, oneshot::Sender<serde_json::Value>>>>,
+    pending: Arc<Mutex<PendingState>>,
     _notification_tx: mpsc::UnboundedSender<BackendEvent>,
     pgid: u32,
     next_id: AtomicU64,
@@ -70,8 +129,7 @@ impl Backend {
         let pgid = child.id().unwrap_or(0);
         child_pgids.lock().unwrap().push(pgid);
 
-        let pending: Arc<Mutex<HashMap<serde_json::Value, oneshot::Sender<serde_json::Value>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<PendingState>> = Arc::new(Mutex::new(PendingState::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let server_info = Arc::new(Mutex::new(None));
 
@@ -81,6 +139,7 @@ impl Backend {
         tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
+            let mut progress_acks = VecDeque::new();
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
@@ -94,18 +153,38 @@ impl Backend {
                         let event = if msg.get("method").is_some() && msg.get("id").is_some() {
                             BackendEvent::PeerRequest(msg)
                         } else if msg.get("method").is_some() {
-                            BackendEvent::Notification(msg)
+                            let ack = if should_order_before_response(&msg) {
+                                let (ack_tx, ack_rx) = oneshot::channel();
+                                progress_acks.push_back(ack_rx);
+                                BackendEventAck::new(ack_tx)
+                            } else {
+                                BackendEventAck::none()
+                            };
+                            BackendEvent::Notification(msg, ack)
                         } else if msg.get("id").is_some() {
                             if let Some(id) = msg.get("id").cloned() {
-                                let sender = pending_clone.lock().await.remove(&id);
-                                if let Some(tx) = sender {
-                                    let _ = tx.send(msg);
+                                let mut pending_guard = pending_clone.lock().await;
+                                if let Some(tx) = pending_guard.pending.remove(&id) {
+                                    drop(pending_guard);
+                                    let response_acks = std::mem::take(&mut progress_acks);
+                                    tokio::spawn(async move {
+                                        for ack in response_acks {
+                                            let _ = ack.await;
+                                        }
+                                        let _ = tx.send(msg);
+                                    });
+                                    continue;
+                                }
+                                if pending_guard.discarded.remove(&id) {
+                                    drop(pending_guard);
+                                    progress_acks.clear();
+                                    tracing::debug!(id = %id, "backend: discarded late response");
                                     continue;
                                 }
                             }
                             BackendEvent::UnmatchedResponse(msg)
                         } else {
-                            BackendEvent::Notification(msg)
+                            BackendEvent::Notification(msg, BackendEventAck::none())
                         };
                         let _ = notif_tx.send(event);
                     }
@@ -117,6 +196,12 @@ impl Backend {
                 }
             }
             alive_clone.store(false, Ordering::Release);
+            let pending_senders = {
+                let mut pending = pending_clone.lock().await;
+                pending.closed = true;
+                std::mem::take(&mut pending.pending)
+            };
+            drop(pending_senders);
             let _ = notif_tx.send(BackendEvent::ProcessExit);
         });
 
@@ -139,10 +224,7 @@ impl Backend {
                         }
                         let mut guard = stderr_buf_clone.lock().await;
                         guard.push_str(&text);
-                        if guard.len() > 4096 {
-                            let trim_at = guard.len() - 4096;
-                            *guard = guard[trim_at..].to_string();
-                        }
+                        retain_utf8_tail(&mut guard, 4096);
                     }
                 }
             }
@@ -171,19 +253,135 @@ impl Backend {
         })?;
 
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id.clone(), tx);
+        {
+            let mut pending = self.pending.lock().await;
+            if pending.closed {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "backend closed before request",
+                ));
+            }
+            pending.pending.insert(id.clone(), tx);
+        }
 
         if let Err(e) = self.write_message(&msg).await {
-            self.pending.lock().await.remove(&id);
+            self.pending.lock().await.pending.remove(&id);
             return Err(e);
         }
 
-        rx.await.map_err(|_| {
+        let response = rx.await.map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "backend closed before response",
             )
-        })
+        })?;
+        Ok(response)
+    }
+
+    pub async fn send_request_with_timeout(
+        &self,
+        msg: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, std::io::Error> {
+        let id = msg.get("id").cloned().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "request missing id")
+        })?;
+
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            if pending.closed {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "backend closed before request",
+                ));
+            }
+            pending.pending.insert(id.clone(), tx);
+        }
+
+        if let Err(e) = self.write_message(&msg).await {
+            self.pending.lock().await.pending.remove(&id);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "backend closed before response",
+            )),
+            Err(_) => {
+                {
+                    let mut pending = self.pending.lock().await;
+                    pending.pending.remove(&id);
+                    pending.mark_discarding(id.clone());
+                }
+                let cancel = crate::mcp_interface::build_notification(
+                    "notifications/cancelled",
+                    Some(serde_json::json!({
+                        "requestId": id,
+                        "reason": "request timed out"
+                    })),
+                );
+                if let Err(e) = self.write_message(&cancel).await {
+                    tracing::warn!(err = %e, "backend: failed to send timeout cancellation");
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "request timed out",
+                ))
+            }
+        }
+    }
+
+    pub async fn cancel_pending_request(&self, id: &Value, reason: &str) -> bool {
+        {
+            let mut pending = self.pending.lock().await;
+            if pending.pending.remove(id).is_none() {
+                return false;
+            }
+            pending.mark_discarding(id.clone());
+        }
+        let cancel = crate::mcp_interface::build_notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({
+                "requestId": id,
+                "reason": reason
+            })),
+        );
+        if let Err(e) = self.write_message(&cancel).await {
+            tracing::warn!(err = %e, "backend: failed to send cancellation");
+        }
+        true
+    }
+
+    pub async fn discard_pending_response(&self, id: &Value) -> bool {
+        let mut pending = self.pending.lock().await;
+        if pending.pending.remove(id).is_some() {
+            pending.mark_discarding(id.clone());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn is_discarding_response(&self, id: &Value) -> bool {
+        self.pending.lock().await.discarded.contains(id)
+    }
+
+    #[cfg(test)]
+    pub async fn discarded_response_count(&self) -> usize {
+        self.pending.lock().await.discarded.len()
+    }
+
+    #[cfg(test)]
+    pub async fn mark_discarding_for_test(&self, id: Value) {
+        self.pending.lock().await.mark_discarding(id);
+    }
+
+    #[cfg(test)]
+    pub async fn pending_response_count(&self) -> usize {
+        self.pending.lock().await.pending.len()
     }
 
     pub async fn send_notification(&self, msg: &serde_json::Value) -> Result<(), std::io::Error> {

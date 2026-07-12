@@ -5,8 +5,9 @@
 <h1>Topology</h1>
 <section>
   <h2>Allowed Crossings</h2>
-  <pre>client stdio -> mcp_interface -> runtime_manager -> mcp_manager | tools | backend_manager -> child MCP server
+  <pre>client stdio -> mcp_interface -> event_plane -> runtime_manager -> mcp_manager | tools | lifetime | backend_manager -> child MCP server
 daemon client stdio -> daemon_manager -> broker_manager -> mcp_manager | tools | backend_manager -> shared child MCP server
+JSON-RPC event -> event_plane mount table -> mounted program id -> owner helper -> port-local outcome execution
 backend observe signal -> backend_manager state -> mcp_manager cache epoch -> runtime_manager | broker_manager evidence
 mcp.wrapper tool call -> tools object method -> backend_manager | mcp_manager -> readback response
 future supervisor registry -> backend id -> backend_manager slot | mcp_manager cache
@@ -16,6 +17,9 @@ wrapper hook method -> mcp_interface -> backend_manager | mcp_manager -> readbac
   <h2>Owner Edges</h2>
   <table>
     <tr><th>From</th><th>To</th><th>Edge</th></tr>
+    <tr><td><code>mcp_interface</code></td><td><code>event_plane</code></td><td>Classified JSON-RPC events resolve through the spec-complete mount table before local semantics are applied.</td></tr>
+    <tr><td><code>event_plane</code></td><td><code>runtime_manager</code>/<code>broker_manager</code></td><td>Port executors apply outcomes; they do not own the method map.</td></tr>
+    <tr><td><code>runtime_manager</code>/<code>broker_manager</code></td><td><code>lifetime</code></td><td>Only request id translation, progress-token validation, peer-session association, and cancel/drop decisions cross this edge.</td></tr>
     <tr><td><code>mcp_interface</code></td><td><code>mcp_manager</code></td><td>Only cacheable MCP methods may read discovery cache.</td></tr>
     <tr><td><code>mcp_interface</code></td><td><code>tools</code></td><td>Only <code>tools/call</code> with name <code>mcp.wrapper</code> may enter wrapper tool invocation.</td></tr>
     <tr><td><code>tools</code></td><td><code>backend_manager</code>/<code>mcp_manager</code></td><td>Only validated object methods may request lifecycle transitions or cache readback through owner APIs.</td></tr>

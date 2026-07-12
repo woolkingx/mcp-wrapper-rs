@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.5.1] - 2026-07-11
+
+### Fixed
+
+- Backend stderr retention now truncates at a valid UTF-8 boundary. Previously,
+  the bounded 4096-byte diagnostic tail sliced a Rust `String` at an arbitrary
+  byte offset. A multibyte character crossing that offset caused a worker panic;
+  the release profile converted it to `SIGABRT`, closing the wrapper transport
+  and making local lifecycle tools such as `backend.restart` unreachable.
+- Added regression coverage for Chinese text, an em dash, emoji, and unchanged
+  short text. Diagnostic content can no longer terminate the control plane.
+- Backend exit now drains pending request senders, so a request cannot wait
+  forever after its backend disappears when no explicit timeout is configured.
+- Daemon cancellation and progress ownership are scoped by session and raw
+  JSON-RPC ID. Reusing numeric or string IDs in different client sessions no
+  longer allows one session to affect another.
+- Cancelled and timed-out backend request IDs remain suppressed even after the
+  bounded tombstone detail cache rotates, preventing late backend responses
+  from leaking as unmatched client-visible messages.
+- Backend progress notifications no longer wait for the consumer from inside
+  the backend reader, removing a response-order deadlock during refresh.
+- Discovery refresh pagination now shares one absolute deadline instead of
+  renewing the timeout for every page or cache key.
+- Standard `notifications/resources/list_changed` refreshes both resources and
+  resource templates, and wrapper-triggered refresh/restart actions notify
+  connected daemon clients after cache mutation.
+- Concurrent daemon integration tests now use isolated broker identities, so
+  one test's cleanup cannot terminate another test's shared broker.
+- Discovery refresh now rejects JSON-RPC error envelopes and malformed list
+  results instead of projecting them as valid empty data. All selected keys are
+  built as one candidate and committed atomically, so a later-key failure
+  cannot mix new and old discovery rows.
+- Cache refresh construction is serialized and commit checks both the base
+  cache epoch and live backend generation. Stale invalidations and candidates
+  crossing a backend restart cannot move committed discovery truth backward.
+- Failed refreshes return an error, preserve the complete prior snapshot, and
+  emit no list-changed notification.
+
+### Changed
+
+- Broker request lifetime is represented by session-aware request rows and
+  backend-generation bindings. Active-call state, cancellation, completion,
+  and cleanup are derived from those owner tables instead of compatibility
+  counters or process-global request IDs.
+- Request and backend generation readback is retained through terminal cleanup,
+  making lifecycle status a projection of owned rows rather than a parallel
+  mutable truth.
+
+### Proof
+
+- `cargo test stderr_tail_truncation`
+- `cargo test backend_manager_tests`
+- `cargo test lifetime_tests`
+- `cargo test`
+- `cargo build --release`
+
 ## [0.5.0] - 2026-06-14
 
 Supervisor-proxy milestone. This release fills gaps that plain stdio MCP leaves

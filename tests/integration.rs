@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -25,6 +25,9 @@ struct Wrapper {
     child: Child,
     stdin: std::process::ChildStdin,
     reader: BufReader<std::process::ChildStdout>,
+    backend_args: Vec<String>,
+    daemon: bool,
+    cleaned: bool,
 }
 
 impl Wrapper {
@@ -33,7 +36,18 @@ impl Wrapper {
     }
 
     fn spawn_with_backend_args(extra_args: &[&str], backend_args: &[&str]) -> Self {
+        Self::spawn_with_env_backend_args(&[], extra_args, backend_args)
+    }
+
+    fn spawn_with_env_backend_args(
+        envs: &[(&str, &str)],
+        extra_args: &[&str],
+        backend_args: &[&str],
+    ) -> Self {
         let mut cmd = Command::new(wrapper_binary());
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
         cmd.args(extra_args);
         cmd.arg("python3").arg(echo_server_path());
         cmd.args(backend_args);
@@ -44,10 +58,14 @@ impl Wrapper {
         let mut child = cmd.spawn().expect("failed to spawn wrapper");
         let stdin = child.stdin.take().unwrap();
         let reader = BufReader::new(child.stdout.take().unwrap());
+        let daemon = extra_args.iter().any(|arg| *arg == "--daemon");
         Wrapper {
             child,
             stdin,
             reader,
+            backend_args: backend_args.iter().map(|arg| (*arg).to_string()).collect(),
+            daemon,
+            cleaned: false,
         }
     }
 
@@ -127,8 +145,30 @@ impl Wrapper {
     }
 
     fn kill(mut self) {
+        self.cleanup();
+    }
+
+    fn cleanup(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        self.cleaned = true;
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if self.daemon {
+            let mut target = vec![
+                "python3".to_string(),
+                echo_server_path().to_string_lossy().to_string(),
+            ];
+            target.extend(self.backend_args.clone());
+            stop_admin_broker(&target);
+        }
+    }
+}
+
+impl Drop for Wrapper {
+    fn drop(&mut self) {
+        self.cleanup();
     }
 }
 
@@ -152,6 +192,10 @@ fn admin_target(suffix: &str) -> Vec<String> {
         echo_server_path().to_string_lossy().to_string(),
         format!("--cli-admin-test-{}-{}", std::process::id(), suffix),
     ]
+}
+
+fn unique_daemon_arg(label: &str) -> String {
+    format!("--test-target-{label}-{}", std::process::id())
 }
 
 fn admin_args(prefix: &[&str], target: &[String]) -> Vec<String> {
@@ -208,6 +252,74 @@ fn sleep_call_target(suffix: &str, unique_arg: &str) -> Vec<String> {
         "1.0".to_string(),
         format!("--{}", suffix),
     ]
+}
+
+fn temp_marker(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("mcp-wrapper-rs-{name}-{}", std::process::id()))
+}
+
+fn wait_for_marker(path: &PathBuf, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(value) = std::fs::read_to_string(path) {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "marker was not written: {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn current_protocol_date() -> String {
+    let unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let mut local_time = libc::tm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 1,
+        tm_mon: 0,
+        tm_year: 70,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: -1,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        tm_gmtoff: 0,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        tm_zone: std::ptr::null(),
+    };
+    let raw_time = unix_seconds as libc::time_t;
+    let ok = unsafe { !libc::localtime_r(&raw_time, &mut local_time).is_null() };
+    if ok {
+        return format!(
+            "{:04}-{:02}-{:02}",
+            local_time.tm_year + 1900,
+            local_time.tm_mon + 1,
+            local_time.tm_mday
+        );
+    }
+    protocol_date_for_unix_days(unix_seconds / 86_400)
+}
+
+fn protocol_date_for_unix_days(unix_days: i64) -> String {
+    let z = unix_days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 // ── CLI tests ────────────────────────────────────────────────────────────────
@@ -426,6 +538,365 @@ fn basic_flow() {
 }
 
 #[test]
+fn initialize_backend_handshake_uses_today_protocol_version() {
+    let marker = temp_marker("init-protocol");
+    let _ = std::fs::remove_file(&marker);
+    let marker_str = marker.to_string_lossy().to_string();
+    let mut w = Wrapper::spawn_with_backend_args(
+        &["--init-timeout", "10"],
+        &["--init-protocol-marker", &marker_str],
+    );
+    w.handshake();
+
+    let backend_protocol: Value =
+        serde_json::from_str(&wait_for_marker(&marker, Duration::from_secs(2))).unwrap();
+    assert_eq!(backend_protocol, json!(current_protocol_date()));
+    assert_ne!(backend_protocol, json!("2024-11-05"));
+
+    w.kill();
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
+fn tools_list_cache_drains_backend_pages_and_rejects_frontend_cursor() {
+    let mut w = Wrapper::spawn_with_backend_args(&["--init-timeout", "10"], &["--paginate-tools"]);
+    w.handshake();
+
+    w.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}));
+    let tools_resp = w.recv();
+    assert!(
+        tools_resp["result"].get("nextCursor").is_none(),
+        "frontend cached list should not expose backend cursor: {tools_resp}"
+    );
+    let tools = tools_resp["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|tool| tool["name"] == "echo"));
+    assert!(tools.iter().any(|tool| tool["name"] == "paged"));
+    assert!(tools.iter().any(|tool| tool["name"] == "mcp.wrapper"));
+
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/list",
+        "params": {"cursor": "page-2"}
+    }));
+    let cursor_resp = w.recv();
+    assert_eq!(cursor_resp["error"]["code"], -32602);
+
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/list",
+        "params": {"cursor": null}
+    }));
+    let null_cursor_resp = w.recv();
+    assert!(
+        null_cursor_resp.get("result").is_some(),
+        "{null_cursor_resp}"
+    );
+
+    w.kill();
+}
+
+#[test]
+fn mcp_timeout_env_times_out_pass_through_and_discards_late_response() {
+    let mut w = Wrapper::spawn_with_env_backend_args(
+        &[("MCP_TIMEOUT", "200")],
+        &["--init-timeout", "10"],
+        &["--sleep-call", "1.0"],
+    );
+    w.handshake();
+
+    let start = Instant::now();
+    w.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"msg": "too slow"}}
+    }));
+    let resp = w.recv();
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "timeout response should beat backend sleep"
+    );
+    assert_eq!(resp["id"], 2);
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("timed out"),
+        "response: {resp}"
+    );
+
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(
+        w.recv_timeout(Duration::from_millis(200)).is_none(),
+        "late backend response should be discarded"
+    );
+    w.kill();
+}
+
+#[test]
+fn client_cancel_translates_request_id_and_discards_late_response() {
+    let marker = temp_marker("client-cancel");
+    let request_marker = temp_marker("client-cancel-ready");
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&request_marker);
+    let marker_str = marker.to_string_lossy().to_string();
+    let request_marker_str = request_marker.to_string_lossy().to_string();
+    let mut w = Wrapper::spawn_with_backend_args(
+        &["--init-timeout", "10"],
+        &[
+            "--cancel-marker",
+            &marker_str,
+            "--request-marker",
+            &request_marker_str,
+            "--respond-after-cancel",
+        ],
+    );
+    w.handshake();
+
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "client-cancel-1",
+        "method": "tools/call",
+        "params": {"name": "wait-cancel", "arguments": {}}
+    }));
+    let backend_request_id: Value =
+        serde_json::from_str(&wait_for_marker(&request_marker, Duration::from_secs(2))).unwrap();
+    assert_ne!(backend_request_id, json!("client-cancel-1"));
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": "client-cancel-1", "reason": "test cancel"}
+    }));
+
+    let backend_cancel_id: Value =
+        serde_json::from_str(&wait_for_marker(&marker, Duration::from_secs(2))).unwrap();
+    assert_ne!(backend_cancel_id, json!("client-cancel-1"));
+    assert!(
+        w.recv_timeout(Duration::from_millis(300)).is_none(),
+        "late backend response after client cancel should be discarded"
+    );
+
+    w.kill();
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&request_marker);
+}
+
+#[test]
+fn backend_progress_requires_active_progress_token() {
+    let mut w = Wrapper::spawn(&["--init-timeout", "10"]);
+    w.handshake();
+
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "progress",
+            "arguments": {"msg": "done"},
+            "_meta": {"progressToken": "progress-token-1"}
+        }
+    }));
+    let progress = w.recv_any();
+    assert_eq!(progress["method"], "notifications/progress");
+    assert_eq!(progress["params"]["progressToken"], "progress-token-1");
+    let response = w.recv();
+    assert_eq!(response["id"], 2);
+    assert_eq!(response["result"]["content"][0]["text"], "done");
+
+    w.kill();
+}
+
+#[test]
+fn backend_progress_with_wrong_token_is_dropped() {
+    let mut w =
+        Wrapper::spawn_with_backend_args(&["--init-timeout", "10"], &["--wrong-progress-token"]);
+    w.handshake();
+
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "progress",
+            "arguments": {"msg": "done"},
+            "_meta": {"progressToken": "progress-token-1"}
+        }
+    }));
+    let response = w.recv_any();
+    assert_eq!(
+        response["id"], 2,
+        "wrong progress token should be dropped before response: {response}"
+    );
+    assert_eq!(response["result"]["content"][0]["text"], "done");
+
+    w.kill();
+}
+
+#[test]
+fn daemon_client_cancel_translates_request_id_and_discards_late_response() {
+    let unique_arg = format!("--daemon-client-cancel-{}", std::process::id());
+    let marker = temp_marker("daemon-client-cancel");
+    let request_marker = temp_marker("daemon-client-cancel-ready");
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&request_marker);
+    let marker_str = marker.to_string_lossy().to_string();
+    let request_marker_str = request_marker.to_string_lossy().to_string();
+    let backend_args = [
+        unique_arg.as_str(),
+        "--cancel-marker",
+        &marker_str,
+        "--request-marker",
+        &request_marker_str,
+        "--respond-after-cancel",
+    ];
+    let target = vec![
+        "python3".to_string(),
+        echo_server_path().to_string_lossy().to_string(),
+        unique_arg.clone(),
+        "--cancel-marker".to_string(),
+        marker_str.clone(),
+        "--request-marker".to_string(),
+        request_marker_str.clone(),
+        "--respond-after-cancel".to_string(),
+    ];
+    stop_admin_broker(&target);
+
+    let mut w =
+        Wrapper::spawn_with_backend_args(&["--daemon", "--init-timeout", "10"], &backend_args);
+    w.handshake();
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "daemon-cancel-1",
+        "method": "tools/call",
+        "params": {"name": "wait-cancel", "arguments": {}}
+    }));
+    let backend_request_id: Value =
+        serde_json::from_str(&wait_for_marker(&request_marker, Duration::from_secs(2))).unwrap();
+    assert_ne!(backend_request_id, json!("daemon-cancel-1"));
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": "daemon-cancel-1", "reason": "test cancel"}
+    }));
+
+    let backend_cancel_id: Value =
+        serde_json::from_str(&wait_for_marker(&marker, Duration::from_secs(2))).unwrap();
+    assert_ne!(backend_cancel_id, json!("daemon-cancel-1"));
+    assert!(
+        w.recv_timeout(Duration::from_millis(300)).is_none(),
+        "daemon late backend response after client cancel should be discarded"
+    );
+
+    w.kill();
+    stop_admin_broker(&target);
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&request_marker);
+}
+
+#[test]
+fn daemon_backend_progress_requires_active_progress_token() {
+    let unique_arg = format!("--daemon-progress-{}", std::process::id());
+    let backend_args = [unique_arg.as_str()];
+    let target = vec![
+        "python3".to_string(),
+        echo_server_path().to_string_lossy().to_string(),
+        unique_arg.clone(),
+    ];
+    stop_admin_broker(&target);
+
+    let mut w =
+        Wrapper::spawn_with_backend_args(&["--daemon", "--init-timeout", "10"], &backend_args);
+    w.handshake();
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "progress",
+            "arguments": {"msg": "done"},
+            "_meta": {"progressToken": "daemon-progress-token-1"}
+        }
+    }));
+    let progress = w.recv_any();
+    assert_eq!(progress["method"], "notifications/progress");
+    assert_eq!(
+        progress["params"]["progressToken"],
+        "daemon-progress-token-1"
+    );
+    let response = w.recv();
+    assert_eq!(response["id"], 2);
+    assert_eq!(response["result"]["content"][0]["text"], "done");
+
+    w.kill();
+    stop_admin_broker(&target);
+}
+
+#[test]
+fn initialized_notification_is_not_reforwarded_to_live_backend() {
+    let marker = temp_marker("duplicate-initialized");
+    let _ = std::fs::remove_file(&marker);
+    let marker_str = marker.to_string_lossy().to_string();
+    let mut w = Wrapper::spawn_with_backend_args(
+        &["--init-timeout", "10"],
+        &["--duplicate-initialized-marker", &marker_str],
+    );
+    w.handshake();
+
+    w.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"msg": "first"}}
+    }));
+    let first = w.recv();
+    assert_eq!(first["result"]["content"][0]["text"], "first");
+
+    w.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !marker.exists(),
+        "duplicate initialized should be dropped before backend"
+    );
+
+    w.kill();
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
+fn daemon_mcp_timeout_env_times_out_pass_through() {
+    let unique_arg = format!("--daemon-request-timeout-test-{}", std::process::id());
+    let backend_args = [unique_arg.as_str(), "--sleep-call", "1.0"];
+    let target = vec![
+        "python3".to_string(),
+        echo_server_path().to_string_lossy().to_string(),
+        unique_arg.clone(),
+        "--sleep-call".to_string(),
+        "1.0".to_string(),
+    ];
+    let mut w = Wrapper::spawn_with_env_backend_args(
+        &[("MCP_TIMEOUT", "200")],
+        &["--daemon", "--init-timeout", "10"],
+        &backend_args,
+    );
+    w.handshake();
+
+    w.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"msg": "too slow"}}
+    }));
+    let resp = w.recv();
+    assert_eq!(resp["id"], 2);
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("timed out"),
+        "response: {resp}"
+    );
+
+    w.kill();
+    stop_admin_broker(&target);
+}
+
+#[test]
 fn wrapper_tool_status_is_injected_and_local() {
     let mut w = Wrapper::spawn(&["--init-timeout", "10"]);
     w.handshake();
@@ -611,12 +1082,84 @@ fn server_request_roundtrip() {
     w.kill();
 }
 
+#[test]
+fn unmatched_client_response_is_not_forwarded_to_backend() {
+    let mut w = Wrapper::spawn(&["--init-timeout", "10"]);
+    w.handshake();
+
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"msg": "backend-live"}}
+    }));
+    let call = w.recv();
+    assert_eq!(call["result"]["content"][0]["text"], "backend-live");
+
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "not-an-active-peer-request",
+        "result": {"content": {"type": "text", "text": "stray"}}
+    }));
+    assert!(
+        w.recv_timeout(Duration::from_millis(300)).is_none(),
+        "unmatched client response must not be forwarded to backend"
+    );
+
+    w.kill();
+}
+
+#[test]
+fn client_progress_for_backend_peer_request_is_forwarded() {
+    let marker = temp_marker("peer-progress");
+    let _ = std::fs::remove_file(&marker);
+    let marker_str = marker.to_string_lossy().to_string();
+    let mut w = Wrapper::spawn_with_backend_args(
+        &["--init-timeout", "10"],
+        &["--peer-progress-marker", &marker_str],
+    );
+    w.handshake();
+
+    w.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "ask-client", "arguments": {}}
+    }));
+    let request = w.recv_any();
+    assert_eq!(request["method"], "sampling/createMessage");
+    assert_eq!(
+        request["params"]["_meta"]["progressToken"],
+        "peer-progress-token-1"
+    );
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {"progressToken": "peer-progress-token-1", "progress": 1}
+    }));
+    let token: Value = serde_json::from_str(&wait_for_marker(&marker, Duration::from_secs(2)))
+        .expect("peer progress marker JSON");
+    assert_eq!(token, json!("peer-progress-token-1"));
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "server-ask-1",
+        "result": {"content": {"type": "text", "text": "client-answer"}}
+    }));
+    let call_resp = w.recv();
+    assert_eq!(call_resp["id"], 2);
+
+    w.kill();
+    let _ = std::fs::remove_file(&marker);
+}
+
 // ── Daemon mode tests ─────────────────────────────────────────────────────────
 
 #[test]
 fn daemon_basic_flow() {
+    let target_arg = unique_daemon_arg("basic");
     // First wrapper: starts broker
-    let mut w1 = Wrapper::spawn(&["--daemon", "--init-timeout", "10"]);
+    let mut w1 = Wrapper::spawn_with_backend_args(
+        &["--daemon", "--init-timeout", "10"],
+        &[target_arg.as_str()],
+    );
     let init1 = w1.handshake();
     assert_eq!(init1["result"]["serverInfo"]["name"], "echo-server");
 
@@ -686,6 +1229,87 @@ fn daemon_wrapper_tool_restart_rejects_active_call() {
 }
 
 #[test]
+fn daemon_wrapper_tool_mutations_notify_peers_after_success_only() {
+    let unique_arg = format!("--daemon-wrapper-notify-{}", std::process::id());
+    let target = vec![
+        "python3".to_string(),
+        echo_server_path().to_string_lossy().to_string(),
+        unique_arg.clone(),
+    ];
+    stop_admin_broker(&target);
+
+    let mut w1 = Wrapper::spawn_with_backend_args(
+        &["--daemon", "--init-timeout", "10"],
+        &[unique_arg.as_str()],
+    );
+    w1.handshake();
+    let mut w2 = Wrapper::spawn_with_backend_args(
+        &["--daemon", "--init-timeout", "10"],
+        &[unique_arg.as_str()],
+    );
+    w2.handshake();
+
+    w1.send(&json!({
+        "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+        "params": {"name": "mcp.wrapper", "arguments": {"action": "backend.status"}}
+    }));
+    assert_eq!(wrapper_envelope(&w1.recv())["ok"], true);
+    assert!(
+        w2.recv_timeout(Duration::from_millis(200)).is_none(),
+        "non-mutating wrapper action must not notify peers"
+    );
+
+    w1.send(&json!({
+        "jsonrpc": "2.0", "id": 10_001, "method": "tools/call",
+        "params": {
+            "name": "mcp.wrapper",
+            "arguments": {"action": "backend.restart", "params": {"force": "yes"}}
+        }
+    }));
+    assert_eq!(wrapper_envelope(&w1.recv())["ok"], false);
+    assert!(
+        w2.recv_timeout(Duration::from_millis(200)).is_none(),
+        "failed wrapper mutation must not notify peers"
+    );
+
+    for (id, action) in [(11, "backend.refresh"), (12, "backend.restart")] {
+        w1.send(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "mcp.wrapper", "arguments": {"action": action}}
+        }));
+        let response = w1.recv();
+        assert_eq!(wrapper_envelope(&response)["ok"], true, "{response}");
+
+        let mut methods = Vec::new();
+        for _ in 0..3 {
+            let notification = w2
+                .recv_timeout(Duration::from_secs(1))
+                .expect("successful mutation should notify peer");
+            methods.push(
+                notification["method"]
+                    .as_str()
+                    .expect("notification method")
+                    .to_string(),
+            );
+        }
+        methods.sort();
+        assert_eq!(
+            methods,
+            vec![
+                "notifications/prompts/list_changed".to_string(),
+                "notifications/resources/list_changed".to_string(),
+                "notifications/tools/list_changed".to_string(),
+            ]
+        );
+        assert!(w2.recv_timeout(Duration::from_millis(200)).is_none());
+    }
+
+    w1.kill();
+    w2.kill();
+    stop_admin_broker(&target);
+}
+
+#[test]
 fn daemon_wrapper_tool_stop_rejects_active_call() {
     let unique_arg = format!("--daemon-wrapper-stop-active-{}", std::process::id());
     let target = sleep_call_target("target", &unique_arg);
@@ -728,12 +1352,19 @@ fn daemon_wrapper_tool_stop_rejects_active_call() {
 
 #[test]
 fn daemon_two_clients_share_broker() {
+    let target_arg = unique_daemon_arg("two-clients");
     // First client starts broker
-    let mut w1 = Wrapper::spawn(&["--daemon", "--init-timeout", "10"]);
+    let mut w1 = Wrapper::spawn_with_backend_args(
+        &["--daemon", "--init-timeout", "10"],
+        &[target_arg.as_str()],
+    );
     w1.handshake();
 
     // Second client connects to same broker
-    let mut w2 = Wrapper::spawn(&["--daemon", "--init-timeout", "10"]);
+    let mut w2 = Wrapper::spawn_with_backend_args(
+        &["--daemon", "--init-timeout", "10"],
+        &[target_arg.as_str()],
+    );
     let init2 = w2.handshake();
     assert_eq!(init2["result"]["serverInfo"]["name"], "echo-server");
 
@@ -858,7 +1489,11 @@ fn cli_admin_backend_restart_rejects_active_daemon_call() {
 
 #[test]
 fn daemon_ping_local() {
-    let mut w = Wrapper::spawn(&["--daemon", "--init-timeout", "10"]);
+    let target_arg = unique_daemon_arg("ping");
+    let mut w = Wrapper::spawn_with_backend_args(
+        &["--daemon", "--init-timeout", "10"],
+        &[target_arg.as_str()],
+    );
     w.handshake();
 
     w.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
@@ -902,6 +1537,57 @@ fn daemon_server_request_roundtrip() {
 
     w.kill();
     std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+#[test]
+fn daemon_client_progress_for_backend_peer_request_is_forwarded() {
+    let unique_arg = format!("--daemon-peer-progress-{}", std::process::id());
+    let marker = temp_marker("daemon-peer-progress");
+    let _ = std::fs::remove_file(&marker);
+    let marker_str = marker.to_string_lossy().to_string();
+    let backend_args = [unique_arg.as_str(), "--peer-progress-marker", &marker_str];
+    let target = vec![
+        "python3".to_string(),
+        echo_server_path().to_string_lossy().to_string(),
+        unique_arg.clone(),
+        "--peer-progress-marker".to_string(),
+        marker_str.clone(),
+    ];
+    stop_admin_broker(&target);
+
+    let mut w =
+        Wrapper::spawn_with_backend_args(&["--daemon", "--init-timeout", "10"], &backend_args);
+    w.handshake();
+    w.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "ask-client", "arguments": {}}
+    }));
+
+    let request = w.recv_any();
+    assert_eq!(request["method"], "sampling/createMessage");
+    assert_eq!(
+        request["params"]["_meta"]["progressToken"],
+        "peer-progress-token-1"
+    );
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {"progressToken": "peer-progress-token-1", "progress": 1}
+    }));
+    let token: Value = serde_json::from_str(&wait_for_marker(&marker, Duration::from_secs(2)))
+        .expect("daemon peer progress marker JSON");
+    assert_eq!(token, json!("peer-progress-token-1"));
+    w.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "server-ask-1",
+        "result": {"content": {"type": "text", "text": "daemon-client-answer"}}
+    }));
+    let call_resp = w.recv();
+    assert_eq!(call_resp["id"], 2);
+
+    w.kill();
+    stop_admin_broker(&target);
+    let _ = std::fs::remove_file(&marker);
 }
 
 #[test]

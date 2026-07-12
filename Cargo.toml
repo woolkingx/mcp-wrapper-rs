@@ -1,6 +1,6 @@
 [package]
 name = "mcp-wrapper-rs"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Stable MCP supervisor proxy with cached discovery, mcp.wrapper lifecycle control, and on-demand backend processes."
 repository = "https://github.com/woolkingx/mcp-wrapper-rs"

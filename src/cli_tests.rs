@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::cli::{AdminAction, CliMode, parse};
+use crate::cli::{parse, AdminAction, CliMode};
 
 fn args(items: &[&str]) -> Vec<String> {
     let mut out = vec!["mcp-wrapper-rs".to_string()];

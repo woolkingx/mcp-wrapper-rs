@@ -5,7 +5,7 @@
 //! (setsid in daemon.rs). Exits after all sessions disconnect + 60s idle.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,44 +15,20 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::backend_manager::{Backend, BackendEvent, ChildPgids};
+use crate::backend_manager::{BackendEvent, ChildPgids};
+use crate::event_plane::{Dir, EventProgramId};
 use crate::mcp_interface::{self, Route};
-use crate::{backend_manager, daemon_manager, mcp_manager, tools};
-
-const BROKER_IDLE_SECS: u64 = 60;
+use crate::{backend_manager, daemon_manager, event_plane, lifetime, mcp_manager, timeouts, tools};
 
 /// Shared state across all sessions.
 struct BrokerState {
     cache: Arc<mcp_manager::Cache>,
     backend_slot: backend_manager::BackendSlot,
     sessions: Mutex<HashMap<u64, mpsc::UnboundedSender<Value>>>,
-    active_peer_session: Mutex<Option<u64>>,
-    active_backend_calls: Arc<AtomicUsize>,
     pass_through_lock: Mutex<()>,
+    request_lifetime: lifetime::RequestLifetime,
+    request_timeout: Option<Duration>,
     next_session_id: AtomicU64,
-}
-
-struct BrokerActiveCallGuard {
-    session_calls: Arc<AtomicUsize>,
-    broker_calls: Arc<AtomicUsize>,
-}
-
-impl BrokerActiveCallGuard {
-    fn new(session_calls: Arc<AtomicUsize>, broker_calls: Arc<AtomicUsize>) -> Self {
-        session_calls.fetch_add(1, Ordering::AcqRel);
-        broker_calls.fetch_add(1, Ordering::AcqRel);
-        Self {
-            session_calls,
-            broker_calls,
-        }
-    }
-}
-
-impl Drop for BrokerActiveCallGuard {
-    fn drop(&mut self) {
-        self.session_calls.fetch_sub(1, Ordering::AcqRel);
-        self.broker_calls.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 /// Entry point for `--broker-internal`. Called from `main()` BEFORE tokio runtime.
@@ -62,7 +38,7 @@ pub fn start_broker_process(args: Vec<String>) {
         let secs: u64 = args[1].parse().unwrap_or(30);
         (Duration::from_secs(secs.max(1)), 2)
     } else {
-        (Duration::from_secs(30), 0)
+        (timeouts::default_init_timeout(), 0)
     };
 
     if args.len() <= cmd_start {
@@ -96,6 +72,13 @@ async fn broker_main(
 ) {
     let _tracing_guard = crate::logging::init_tracing(&cmd, &cmd_args);
     info!(cmd = %cmd, version = env!("CARGO_PKG_VERSION"), "broker: starting");
+    let request_timeout = match timeouts::PassThroughRequestTimeout::from_env() {
+        Ok(timeout) => timeout.duration(),
+        Err(msg) => {
+            warn!(err = %msg, "broker: request timeout disabled");
+            None
+        }
+    };
 
     let paths = daemon_manager::daemon_paths(&cmd, &cmd_args);
     let child_pgids: ChildPgids = backend_manager::new_child_pgids();
@@ -133,9 +116,9 @@ async fn broker_main(
         cache,
         backend_slot,
         sessions: Mutex::new(HashMap::new()),
-        active_peer_session: Mutex::new(None),
-        active_backend_calls: Arc::new(AtomicUsize::new(0)),
         pass_through_lock: Mutex::new(()),
+        request_lifetime: lifetime::RequestLifetime::new(),
+        request_timeout,
         next_session_id: AtomicU64::new(1),
     });
 
@@ -167,13 +150,73 @@ async fn broker_main(
     tokio::spawn(async move {
         while let Some(event) = notif_rx.recv().await {
             match event {
-                BackendEvent::Notification(notif) => {
+                BackendEvent::Notification(notif, ack) => {
                     let method = notif.get("method").and_then(|v| v.as_str()).unwrap_or("");
-                    if let Some(key) = mcp_interface::is_list_changed_notification(method) {
+                    let notification_program =
+                        event_plane::notification_program(Dir::ServerToClient, method);
+                    if notification_program == Some(EventProgramId::ProgressRequest) {
+                        let Some(session_id) = fanout_state
+                            .request_lifetime
+                            .session_for_backend_progress(&notif)
+                            .await
+                        else {
+                            debug!(method = %method, "broker: dropping unmatched backend progress notification");
+                            continue;
+                        };
+                        send_to_session(&fanout_state, session_id, notif).await;
+                        drop(ack);
+                        continue;
+                    }
+                    if notification_program == Some(EventProgramId::CancelRequest) {
+                        let backend = fanout_state.backend_slot.handle();
+                        let be = {
+                            let guard = backend.lock().await;
+                            guard.as_ref().cloned()
+                        };
+                        let Some(be) = be else {
+                            debug!(method = %method, "broker: dropping backend cancellation without live backend");
+                            continue;
+                        };
+                        let Some(translated) = fanout_state
+                            .request_lifetime
+                            .translate_backend_cancel(&notif, &be)
+                            .await
+                        else {
+                            debug!(method = %method, "broker: dropping unmatched backend cancellation");
+                            continue;
+                        };
+                        let Some(session_id) = translated.session_id else {
+                            debug!(method = %method, "broker: dropping backend cancellation without session");
+                            continue;
+                        };
+                        send_to_session(&fanout_state, session_id, translated.message).await;
+                        continue;
+                    }
+                    let invalidated_keys = event_plane::list_changed_data_keys(method);
+                    if !invalidated_keys.is_empty() {
                         info!(method = %method, "broker: cache invalidation");
-                        refresh_mcp_data_key(&fanout_state, key).await;
+                        let refresh_state = fanout_state.clone();
+                        tokio::spawn(async move {
+                            if refresh_state.backend_slot.live().await.is_some() {
+                                match refresh_state
+                                    .cache
+                                    .refresh_keys(&refresh_state.backend_slot, &invalidated_keys)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        fanout_to_all_sessions(&refresh_state, notif).await;
+                                    }
+                                    Err(error) => {
+                                        warn!(err = %error, "broker: cache invalidation refresh aborted");
+                                    }
+                                }
+                            }
+                            drop(ack);
+                        });
+                        continue;
                     }
                     fanout_to_all_sessions(&fanout_state, notif).await;
+                    drop(ack);
                 }
                 BackendEvent::PeerRequest(req) => {
                     forward_peer_request(&fanout_state, req).await;
@@ -184,6 +227,7 @@ async fn broker_main(
                 }
                 BackendEvent::ProcessExit => {
                     warn!("broker: backend process exit observed");
+                    fanout_state.request_lifetime.clear_peer_requests().await;
                 }
             }
         }
@@ -283,34 +327,13 @@ async fn idle_check(state: &Arc<BrokerState>, no_idle_timeout: bool) {
 
         // Normal idle: had sessions, all gone, idle too long
         if ever_had_session
-            && now.duration_since(last_active) > Duration::from_secs(BROKER_IDLE_SECS)
+            && now.duration_since(last_active) > Duration::from_secs(timeouts::BROKER_IDLE_SECS)
         {
-            info!("broker: idle timeout ({BROKER_IDLE_SECS}s with no sessions)");
+            info!(
+                idle_secs = timeouts::BROKER_IDLE_SECS,
+                "broker: idle timeout with no sessions"
+            );
             return;
-        }
-    }
-}
-
-async fn refresh_mcp_data_key(state: &Arc<BrokerState>, key: mcp_interface::McpDataKey) {
-    let backend = state.backend_slot.handle();
-    let be = {
-        let guard = backend.lock().await;
-        guard.as_ref().cloned()
-    };
-    if let Some(be) = be {
-        if be.is_alive() {
-            let list_method = mcp_interface::method_for_mcp_data_key(&key);
-            let req = mcp_interface::build_request(be.next_request_id(), list_method, None);
-            match tokio::time::timeout(Duration::from_secs(5), be.send_request(req)).await {
-                Ok(Ok(resp)) => {
-                    if let Some(result) = resp.get("result").cloned() {
-                        state.cache.update(&key, result);
-                        info!(method = list_method, "broker: cache refreshed");
-                    }
-                }
-                Ok(Err(e)) => warn!(err = %e, "broker: cache refresh failed"),
-                Err(_) => warn!("broker: cache refresh timeout"),
-            }
         }
     }
 }
@@ -324,9 +347,27 @@ async fn fanout_to_all_sessions(state: &Arc<BrokerState>, msg: Value) {
     }
 }
 
+async fn send_to_session(state: &Arc<BrokerState>, session_id: u64, msg: Value) {
+    let sessions = state.sessions.lock().await;
+    let Some(tx) = sessions.get(&session_id) else {
+        debug!(session = session_id, "broker: active session missing");
+        return;
+    };
+    if tx.send(msg).is_err() {
+        debug!(
+            session = session_id,
+            "broker: active session channel closed"
+        );
+    }
+}
+
 async fn forward_peer_request(state: &Arc<BrokerState>, req: Value) {
-    let active_session = *state.active_peer_session.lock().await;
+    let active_session = state.request_lifetime.unique_bound_session().await;
     if let Some(session_id) = active_session {
+        state
+            .request_lifetime
+            .insert_peer_request(Some(session_id), &req)
+            .await;
         let sessions = state.sessions.lock().await;
         if let Some(tx) = sessions.get(&session_id) {
             if tx.send(req).is_err() {
@@ -359,7 +400,6 @@ async fn handle_session(session_id: u64, stream: UnixStream, state: Arc<BrokerSt
     let mut uds_writer = writer;
 
     let (session_tx, mut session_rx) = mpsc::unbounded_channel::<Value>();
-    let active_session_calls = Arc::new(AtomicUsize::new(0));
     let mut uds_closed = false;
     state
         .sessions
@@ -368,7 +408,13 @@ async fn handle_session(session_id: u64, stream: UnixStream, state: Arc<BrokerSt
         .insert(session_id, session_tx.clone());
 
     loop {
-        if uds_closed && active_session_calls.load(Ordering::Acquire) == 0 && session_rx.is_empty()
+        if uds_closed
+            && state
+                .request_lifetime
+                .active_count_for_session(session_id)
+                .await
+                == 0
+            && session_rx.is_empty()
         {
             break;
         }
@@ -401,11 +447,14 @@ async fn handle_session(session_id: u64, stream: UnixStream, state: Arc<BrokerSt
                                     raw,
                                     state.clone(),
                                     session_tx.clone(),
-                                    active_session_calls.clone(),
                                 ).await;
                             }
                             mcp_interface::JsonRpcMessage::Notification { method, .. } => {
                                 if method.is_empty() { continue; }
+                                if event_plane::should_drop_client_notification(&method) {
+                                    debug!(session = session_id, method = %method, "broker: dropping local client notification");
+                                    continue;
+                                }
                                 let backend = state.backend_slot.handle();
                                 let be = {
                                     let guard = backend.lock().await;
@@ -413,13 +462,69 @@ async fn handle_session(session_id: u64, stream: UnixStream, state: Arc<BrokerSt
                                 };
                                 if let Some(be) = be {
                                     if be.is_alive() {
+                                        let notification_program =
+                                            event_plane::notification_program(
+                                                Dir::ClientToServer,
+                                                &method,
+                                            );
+                                        if notification_program
+                                            == Some(EventProgramId::CancelRequest)
+                                        {
+                                            if state
+                                                .request_lifetime
+                                                .cancel_client_request_for_session(
+                                                    session_id,
+                                                    &raw,
+                                                    &be,
+                                                )
+                                                .await
+                                            {
+                                                debug!(session = session_id, method = %method, "broker: forwarded translated client cancellation");
+                                            } else if state
+                                                .request_lifetime
+                                                .client_cancel_peer_request_for_session(
+                                                    session_id,
+                                                    &raw,
+                                                )
+                                                .await
+                                            {
+                                                if let Err(e) = be.send_notification(&raw).await {
+                                                    warn!(session = session_id, err = %e, method = %method, "broker: forward peer cancellation failed");
+                                                }
+                                            } else {
+                                                debug!(session = session_id, method = %method, "broker: dropping unmatched client cancellation");
+                                            }
+                                            continue;
+                                        }
+                                        if notification_program
+                                            == Some(EventProgramId::ProgressRequest)
+                                        {
+                                            if state
+                                                .request_lifetime
+                                                .client_progress_is_active_for_session(
+                                                    session_id,
+                                                    &raw,
+                                                )
+                                                .await
+                                            {
+                                                if let Err(e) = be.send_notification(&raw).await {
+                                                    warn!(session = session_id, err = %e, method = %method, "broker: forward peer progress failed");
+                                                }
+                                            } else {
+                                                debug!(session = session_id, method = %method, "broker: dropping unmatched client progress notification");
+                                            }
+                                            continue;
+                                        }
                                         let _ = be.send_notification(&raw).await;
                                     }
                                 }
                             }
                             mcp_interface::JsonRpcMessage::Response { .. } => {
-                                let active_session = *state.active_peer_session.lock().await;
-                                if active_session == Some(session_id) {
+                                if state
+                                    .request_lifetime
+                                    .take_peer_response_for_session(session_id, &raw)
+                                    .await
+                                {
                                     let backend = state.backend_slot.handle();
                                     let be = {
                                         let guard = backend.lock().await;
@@ -433,7 +538,7 @@ async fn handle_session(session_id: u64, stream: UnixStream, state: Arc<BrokerSt
                                         }
                                     }
                                 } else {
-                                    debug!(session = session_id, "broker: unexpected response");
+                                    debug!(session = session_id, "broker: dropping unmatched client response");
                                 }
                             }
                         }
@@ -474,67 +579,120 @@ async fn handle_request(
     raw: Value,
     state: Arc<BrokerState>,
     session_tx: mpsc::UnboundedSender<Value>,
-    active_session_calls: Arc<AtomicUsize>,
 ) {
-    if tools::is_wrapper_tool_call(&raw) {
+    if event_plane::is_wrapper_tool_request(&raw) {
+        let active_calls = state.request_lifetime.active_count().await;
+        let action = raw
+            .get("params")
+            .and_then(|params| params.get("arguments"))
+            .and_then(|arguments| arguments.get("action"))
+            .and_then(|action| action.as_str());
         let result = tools::invoke(
             &raw,
             tools::InvocationContext {
                 cache: &state.cache,
                 backend_slot: &state.backend_slot,
-                active_calls: &state.active_backend_calls,
+                active_calls,
             },
         )
         .await;
+        let mutation_succeeded =
+            matches!(action, Some("backend.refresh") | Some("backend.restart"))
+                && result
+                    .pointer("/_meta/mcpWrapper/ok")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
         let _ = session_tx.send(mcp_interface::build_response(client_id, result));
+        if mutation_succeeded {
+            notify_clients_list_changed(&state).await;
+        }
         return;
     }
 
     let resp = match mcp_interface::route(&method) {
         Route::McpData(key) => {
             debug!(session = session_id, method = %method, "broker: cache");
-            match state.cache.lookup(&key) {
-                Some(result) => mcp_interface::build_response(client_id, result),
-                None => mcp_interface::build_error_response(
+            if mcp_manager::cached_list_request_has_cursor(&key, &raw) {
+                mcp_interface::build_error_response(
                     client_id,
-                    mcp_interface::error_codes::INTERNAL_ERROR,
-                    "cache miss",
+                    mcp_interface::error_codes::INVALID_PARAMS,
+                    "cursor is not valid for cached list view",
                     None,
-                ),
+                )
+            } else {
+                match state.cache.lookup(&key) {
+                    Some(result) => mcp_interface::build_response(client_id, result),
+                    None => mcp_interface::build_error_response(
+                        client_id,
+                        mcp_interface::error_codes::INTERNAL_ERROR,
+                        "cache miss",
+                        None,
+                    ),
+                }
             }
         }
         Route::Local => {
             mcp_interface::build_response(client_id, Value::Object(serde_json::Map::new()))
         }
         Route::WrapperControl(control) => {
-            handle_wrapper_control(
+            let active_calls = state.request_lifetime.active_count().await;
+            let mutates_discovery = matches!(
+                control,
+                mcp_interface::WrapperControlMethod::BackendRefresh
+                    | mcp_interface::WrapperControlMethod::BackendRestart
+            );
+            let resp = handle_wrapper_control(
                 client_id,
                 control,
                 raw,
                 &state.cache,
                 &state.backend_slot,
-                &state.active_backend_calls,
+                active_calls,
             )
-            .await
+            .await;
+            if mutates_discovery && resp.get("error").is_none() {
+                notify_clients_list_changed(&state).await;
+            }
+            resp
         }
         Route::PassThrough => {
-            let active_call_guard = BrokerActiveCallGuard::new(
-                active_session_calls.clone(),
-                state.active_backend_calls.clone(),
-            );
+            let admitted = state
+                .request_lifetime
+                .admit_with_session(Some(session_id), client_id.clone(), &raw)
+                .await;
+            if !admitted {
+                let resp = mcp_interface::build_error_response(
+                    client_id,
+                    mcp_interface::error_codes::INVALID_REQUEST,
+                    "duplicate active request id in session",
+                    None,
+                );
+                let _ = session_tx.send(resp);
+                return;
+            }
             tokio::spawn(async move {
-                let _active_call_guard = active_call_guard;
                 let _serialize_backend_call = state.pass_through_lock.lock().await;
+                if !state
+                    .request_lifetime
+                    .contains_client_for_session(session_id, &client_id)
+                    .await
+                {
+                    return;
+                }
                 info!(session = session_id, method = %method, "broker: pass-through");
 
                 if let Err(msg) = ensure_backend(&state).await {
                     warn!(session = session_id, err = %msg, "broker: backend spawn failed");
                     let resp = mcp_interface::build_error_response(
-                        client_id,
+                        client_id.clone(),
                         mcp_interface::error_codes::INTERNAL_ERROR,
                         &msg,
                         None,
                     );
+                    state
+                        .request_lifetime
+                        .remove_client_for_session(session_id, &client_id)
+                        .await;
                     let _ = session_tx.send(resp);
                     return;
                 }
@@ -548,42 +706,87 @@ async fn handle_request(
                     Some(be) => be,
                     None => {
                         let resp = mcp_interface::build_error_response(
-                            client_id,
+                            client_id.clone(),
                             mcp_interface::error_codes::INTERNAL_ERROR,
                             "backend unavailable",
                             None,
                         );
+                        state
+                            .request_lifetime
+                            .remove_client_for_session(session_id, &client_id)
+                            .await;
                         let _ = session_tx.send(resp);
                         return;
                     }
                 };
 
+                if !state
+                    .request_lifetime
+                    .contains_client_for_session(session_id, &client_id)
+                    .await
+                {
+                    return;
+                }
+
                 let backend_id = be.next_request_id();
                 let mut forwarded = raw;
                 forwarded["id"] = backend_id.clone();
+                state
+                    .request_lifetime
+                    .bind_backend(Some(session_id), &client_id, backend_id.clone())
+                    .await;
 
-                *state.active_peer_session.lock().await = Some(session_id);
-                let resp = match be.send_request(forwarded).await {
+                let request_result = match state.request_timeout {
+                    Some(timeout) => be.send_request_with_timeout(forwarded, timeout).await,
+                    None => be.send_request(forwarded).await,
+                };
+                if matches!(
+                    request_result.as_ref().map_err(|e| e.kind()),
+                    Err(std::io::ErrorKind::TimedOut)
+                ) {
+                    state
+                        .request_lifetime
+                        .timeout_client_for_session(session_id, &client_id)
+                        .await;
+                } else {
+                    state
+                        .request_lifetime
+                        .remove_client_for_session(session_id, &client_id)
+                        .await;
+                }
+
+                let resp = match request_result {
                     Ok(mut resp) => {
-                        *state.active_peer_session.lock().await = None;
                         resp["id"] = client_id;
                         resp
                     }
                     Err(e) => {
-                        *state.active_peer_session.lock().await = None;
-                        let detail = format!("{}", e);
-                        warn!(session = session_id, method = %method, err = %detail, "broker: pass-through failed");
-                        let backend = state.backend_slot.handle();
-                        let mut guard = backend.lock().await;
-                        if let Some(dead) = guard.take() {
-                            dead.kill().await;
+                        if e.kind() == std::io::ErrorKind::TimedOut {
+                            warn!(session = session_id, method = %method, "broker: pass-through timed out");
+                            mcp_interface::build_error_response(
+                                client_id,
+                                mcp_interface::error_codes::INTERNAL_ERROR,
+                                "request timed out",
+                                None,
+                            )
+                        } else if be.is_discarding_response(&backend_id).await {
+                            warn!(session = session_id, method = %method, "broker: pass-through cancelled");
+                            return;
+                        } else {
+                            let detail = format!("{}", e);
+                            warn!(session = session_id, method = %method, err = %detail, "broker: pass-through failed");
+                            let backend = state.backend_slot.handle();
+                            let mut guard = backend.lock().await;
+                            if let Some(dead) = guard.take() {
+                                dead.kill().await;
+                            }
+                            mcp_interface::build_error_response(
+                                client_id,
+                                mcp_interface::error_codes::INTERNAL_ERROR,
+                                &detail,
+                                None,
+                            )
                         }
-                        mcp_interface::build_error_response(
-                            client_id,
-                            mcp_interface::error_codes::INTERNAL_ERROR,
-                            &detail,
-                            None,
-                        )
                     }
                 };
 
@@ -602,7 +805,7 @@ async fn handle_wrapper_control(
     raw: Value,
     cache: &Arc<mcp_manager::Cache>,
     backend_slot: &backend_manager::BackendSlot,
-    active_calls: &Arc<AtomicUsize>,
+    active_calls: usize,
 ) -> Value {
     match control {
         mcp_interface::WrapperControlMethod::BackendStatus => {
@@ -622,8 +825,8 @@ async fn handle_wrapper_control(
                 let guard = backend.lock().await;
                 guard.as_ref().cloned()
             };
-            let be = match be {
-                Some(be) if be.is_alive() => be,
+            match be {
+                Some(be) if be.is_alive() => {}
                 _ => {
                     return mcp_interface::build_error_response(
                         client_id,
@@ -632,9 +835,16 @@ async fn handle_wrapper_control(
                         None,
                     );
                 }
-            };
-            let report = cache.refresh_all(&be, backend_slot.generation()).await;
-            mcp_interface::build_response(client_id, report.to_value())
+            }
+            match cache.refresh_all(backend_slot).await {
+                Ok(report) => mcp_interface::build_response(client_id, report.to_value()),
+                Err(error) => mcp_interface::build_error_response(
+                    client_id,
+                    mcp_interface::error_codes::INTERNAL_ERROR,
+                    &error,
+                    None,
+                ),
+            }
         }
         mcp_interface::WrapperControlMethod::BackendRestart => {
             let force = raw
@@ -642,10 +852,7 @@ async fn handle_wrapper_control(
                 .and_then(|v| v.get("force"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if backend_manager::BackendSlot::restart_blocked_by_active_calls(
-                active_calls.load(Ordering::Acquire),
-                force,
-            ) {
+            if backend_manager::BackendSlot::restart_blocked_by_active_calls(active_calls, force) {
                 return mcp_interface::build_error_response(
                     client_id,
                     mcp_interface::error_codes::INTERNAL_ERROR,
@@ -661,8 +868,8 @@ async fn handle_wrapper_control(
                     None,
                 );
             }
-            let be = match backend_slot.live().await {
-                Some(be) => be,
+            match backend_slot.live().await {
+                Some(_) => {}
                 None => {
                     return mcp_interface::build_error_response(
                         client_id,
@@ -671,14 +878,19 @@ async fn handle_wrapper_control(
                         None,
                     );
                 }
-            };
-            let report = cache.refresh_all(&be, backend_slot.generation()).await;
-            mcp_interface::build_response(client_id, report.to_value())
+            }
+            match cache.refresh_all(backend_slot).await {
+                Ok(report) => mcp_interface::build_response(client_id, report.to_value()),
+                Err(error) => mcp_interface::build_error_response(
+                    client_id,
+                    mcp_interface::error_codes::INTERNAL_ERROR,
+                    &error,
+                    None,
+                ),
+            }
         }
         mcp_interface::WrapperControlMethod::BackendStop => {
-            if backend_manager::BackendSlot::stop_blocked_by_active_calls(
-                active_calls.load(Ordering::Acquire),
-            ) {
+            if backend_manager::BackendSlot::stop_blocked_by_active_calls(active_calls) {
                 return mcp_interface::build_error_response(
                     client_id,
                     mcp_interface::error_codes::INTERNAL_ERROR,
@@ -728,45 +940,20 @@ async fn ensure_backend(state: &Arc<BrokerState>) -> Result<(), String> {
 
     let was_spawned = state.backend_slot.ensure().await?;
     if was_respawn && was_spawned {
-        let backend = state.backend_slot.handle();
-        let be = {
-            let guard = backend.lock().await;
-            guard.as_ref().cloned()
-        };
-        refresh_cache_from_backend(be, &state.cache).await;
-        notify_clients_list_changed(state).await;
+        if refresh_cache_from_backend(state).await {
+            notify_clients_list_changed(state).await;
+        }
     }
     Ok(())
 }
 
 /// Query all list/* endpoints from the live backend and update cache.
-async fn refresh_cache_from_backend(be: Option<Arc<Backend>>, cache: &Arc<mcp_manager::Cache>) {
-    let be = match be {
-        Some(be) => be,
-        None => return,
-    };
-
-    let keys_methods = [
-        (mcp_interface::McpDataKey::ToolsList, "tools/list"),
-        (mcp_interface::McpDataKey::PromptsList, "prompts/list"),
-        (mcp_interface::McpDataKey::ResourcesList, "resources/list"),
-        (
-            mcp_interface::McpDataKey::ResourceTemplatesList,
-            "resources/templates/list",
-        ),
-    ];
-
-    for (key, method) in &keys_methods {
-        let req = mcp_interface::build_request(be.next_request_id(), method, None);
-        match tokio::time::timeout(Duration::from_secs(5), be.send_request(req)).await {
-            Ok(Ok(resp)) => {
-                if let Some(result) = resp.get("result").cloned() {
-                    cache.update(key, result);
-                    info!(method = *method, "broker: cache refreshed after respawn");
-                }
-            }
-            Ok(Err(e)) => warn!(method = *method, err = %e, "broker: cache refresh failed"),
-            Err(_) => warn!(method = *method, "broker: cache refresh timeout"),
+async fn refresh_cache_from_backend(state: &Arc<BrokerState>) -> bool {
+    match state.cache.refresh_all(&state.backend_slot).await {
+        Ok(_) => true,
+        Err(error) => {
+            warn!(err = %error, "broker: cache refresh after respawn aborted");
+            false
         }
     }
 }
@@ -774,20 +961,14 @@ async fn refresh_cache_from_backend(be: Option<Arc<Backend>>, cache: &Arc<mcp_ma
 /// Send list_changed notifications to all connected clients.
 /// Called after cache is already refreshed, so clients get fresh data.
 async fn notify_clients_list_changed(state: &Arc<BrokerState>) {
-    let notifications = [
-        "notifications/tools/list_changed",
-        "notifications/prompts/list_changed",
-        "notifications/resources/list_changed",
-    ];
-
     let sessions = state.sessions.lock().await;
-    for method in &notifications {
+    for method in event_plane::list_changed_notification_methods() {
         let notif = mcp_interface::build_notification(method, None);
         for (sid, tx) in sessions.iter() {
             if tx.send(notif.clone()).is_err() {
                 debug!(
                     session = sid,
-                    method = *method,
+                    method = method,
                     "broker: notify channel closed"
                 );
             }

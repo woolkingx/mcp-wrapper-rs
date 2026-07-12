@@ -17,7 +17,10 @@ impl ObjectTree {
         }
 
         let data = self.to_value();
-        let matched: Vec<&Value> = subs.iter().filter(|s| matches(s, &data, self.root_schema())).collect();
+        let matched: Vec<&Value> = subs
+            .iter()
+            .filter(|s| matches(s, &data, self.root_schema()))
+            .collect();
         match matched.len() {
             0 => Err(ValidationError::root(
                 ErrorKind::OneOfNoneMatch,
@@ -68,7 +71,9 @@ impl ObjectTree {
         };
 
         let sources: Vec<&Value> = std::iter::once(schema).chain(subs.iter()).collect();
-        let merged = sources.into_iter().fold(Value::Object(serde_json::Map::new()), deep_merge);
+        let merged = sources
+            .into_iter()
+            .fold(Value::Object(serde_json::Map::new()), deep_merge);
         ObjectTree::new(self.to_value(), merged)
     }
 
@@ -131,7 +136,10 @@ impl ObjectTree {
             .filter_map(|k| data_obj.get(k).map(|v| (k.clone(), v.clone())))
             .collect();
 
-        Ok(ObjectTree::new(Value::Object(filtered), resolved_ref.clone()))
+        Ok(ObjectTree::new(
+            Value::Object(filtered),
+            resolved_ref.clone(),
+        ))
     }
 
     /// `contains` (EXISTS): true if any array element matches the schema.
@@ -146,7 +154,8 @@ impl ObjectTree {
             Some(a) => a,
             None => return false,
         };
-        arr.iter().any(|item| matches(target, item, self.root_schema()))
+        arr.iter()
+            .any(|item| matches(target, item, self.root_schema()))
     }
 
     // --- Helpers ---
@@ -163,7 +172,10 @@ impl ObjectTree {
         let data = self.to_value();
         for keyword in ["oneOf", "anyOf"] {
             if let Some(subs) = schema.get(keyword).and_then(|v| v.as_array()) {
-                let matched: Vec<&Value> = subs.iter().filter(|s| matches(s, &data, self.root_schema())).collect();
+                let matched: Vec<&Value> = subs
+                    .iter()
+                    .filter(|s| matches(s, &data, self.root_schema()))
+                    .collect();
                 match matched.len() {
                     0 => {}
                     1 => return Ok(Some(matched[0].clone())),
@@ -171,9 +183,7 @@ impl ObjectTree {
                         let method = keyword.replace("Of", "_of");
                         return Err(ValidationError::root(
                             ErrorKind::OneOfMultipleMatch,
-                            format!(
-                                "project: {keyword} has {n} matches, use {method}() first"
-                            ),
+                            format!("project: {keyword} has {n} matches, use {method}() first"),
                         ));
                     }
                 }

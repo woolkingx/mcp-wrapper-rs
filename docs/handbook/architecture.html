@@ -12,6 +12,7 @@
   <h2>Architecture Thesis</h2>
   <pre>stdio wrapper
 -> JSON-RPC envelope owner
+-> eBPF-isomorphic event plane
 -> MCP tool/resource/prompt discovery owner
 -> backend process owner
 -> runtime or broker composition owner
@@ -25,6 +26,8 @@
     <tr><th>Owner</th><th>Owns</th><th>Must not own</th></tr>
     <tr><td><a href="../../src/main.rs"><code>main.rs</code></a></td><td>CLI flag parse, version/help, top-level normal/daemon/broker dispatch.</td><td>Runtime policy, protocol semantics, backend lifecycle decisions.</td></tr>
     <tr><td><a href="../../src/mcp_interface.rs"><code>mcp_interface</code></a></td><td>JSON-RPC line read/write, request/response/notification classification, MCP method route table, wrapper control method names.</td><td>Cache mutation, backend spawn/kill, daemon socket state.</td></tr>
+    <tr><td><a href="../../src/event_plane.rs"><code>event_plane</code></a></td><td>Spec-complete attach-point map, mounted program ids, verifier gates, wrapper-tool selector projection, list-change projection, and local notification drop decisions.</td><td>Port mechanics, stdout writes, cache mutation, raw backend handle access.</td></tr>
+    <tr><td><a href="../../src/lifetime.rs"><code>lifetime</code></a></td><td>Request id translation indexes, progress-token validation, peer request/session association, cancel matching, and late-response discard routing.</td><td>Backend process writes, cache semantics, or client transport ownership.</td></tr>
     <tr><td><a href="../../src/mcp_manager.rs"><code>mcp_manager</code></a></td><td>MCP initialize handshake, tool/resource/prompt discovery cache, capability filtering, cache epoch, refresh reports, and the externally served <code>tools/list</code> / <code>initialize</code> view hold-state.</td><td>Child process lifecycle, client stdio loop, broker sessions.</td></tr>
     <tr><td><a href="../../src/tools/mod.rs"><code>tools</code></a></td><td>Unified external tools window, <code>mcp.wrapper</code> descriptor, action schema, invocation validation, result envelope, and object-method dispatch to existing owner APIs.</td><td>Backend process lifecycle, MCP discovery cache ownership, daemon socket state, or log identity.</td></tr>
     <tr><td><a href="../../src/backend_manager.rs"><code>backend_manager</code></a></td><td>Child process slot, stdin/stdout/stderr, pending response match, process group, generation, degraded state, restart/stop/ping hooks, the live-backend query (<code>live()</code>), and the active-call rejection invariant.</td><td>MCP list semantics, cache writes, client routing policy.</td></tr>
@@ -54,6 +57,7 @@
   <h2>Concurrency</h2>
   <ul>
     <li>Oneshot channels match request/response (client ID remapped to a monotonic backend ID, restored on response).</li>
+    <li>The request lifetime map indexes client IDs, backend IDs, peer request IDs, progress tokens, and daemon session IDs; it does not replace the backend channel map that owns completion.</li>
     <li><code>tokio::sync::Mutex</code> guards backend access because the lock spans <code>.await</code>; <code>child_pgids</code> uses <code>std::sync::Mutex</code> because access is sync-only.</li>
     <li>Bidirectional notification relay runs between client and backend.</li>
   </ul>
@@ -62,6 +66,7 @@
   <h2>Planes</h2>
   <table>
     <tr><th>Plane</th><th>Path</th><th>Rule</th></tr>
+    <tr><td>Event plane</td><td><code>JsonRpcEvent -> EventKey -> EventProgramId -> owner helper -> Outcome</code></td><td>Protocol decisions are mounted programs in <code>event_plane</code>. Unknown future events pass through by default; spec-known events must have explicit entries.</td></tr>
     <tr><td>Data plane</td><td><code>client stdio -> mcp_interface -> runtime_manager -> mcp_manager | tools | backend_manager -> child stdio</code></td><td>JSON-RPC envelopes carry MCP discovery, <code>mcp.wrapper</code> action calls, and dynamic call data. Requests either read cached MCP tool/resource/prompt data, invoke a wrapper tool object method, return local wrapper response, or pass through with ID restoration.</td></tr>
     <tr><td>Daemon data plane</td><td><code>client stdio -> daemon_manager UDS relay -> broker_manager -> mcp_manager | tools | backend_manager</code></td><td>Daemon clients do not own backend state. The broker owns the shared backend/cache pair and calls <code>tools</code> only with broker-owned context.</td></tr>
     <tr><td>Control plane</td><td><code>observe -> owner state -> hook -> transition -> readback -> evidence</code></td><td>No component may infer backend truth from a notification alone.</td></tr>
@@ -119,13 +124,15 @@ mcp-wrapper-rs doctor --json -- &lt;command&gt; [args...]</pre>
 <section>
   <h2>Daemon Boundary</h2>
   <p>Daemon mode is an optimization for sharing one backend among compatible wrapper sessions. It is safe only when the wrapped server can tolerate shared session/backend state. Stateful or per-client servers should use normal mode unless the server's own semantics explicitly allow sharing.</p>
-  <p>Server-to-client requests are request-scoped. The broker routes them to the active peer session and rejects unassociated backend requests instead of broadcasting them. Notifications can fan out only when the MCP method is a legal notification and cache readback has already been refreshed when required.</p>
+  <p>Server-to-client requests are request-scoped. The broker routes them to the active peer session and rejects unassociated backend requests instead of broadcasting them. Progress and cancellation notifications are tied to the request lifetime map and same-session token/id checks; cache/list-change notifications can fan out only after cache readback has already been refreshed when required.</p>
 </section>
 <section>
   <h2>Proof Boundary</h2>
   <table>
     <tr><th>Claim</th><th>Proof owner</th><th>Gate</th></tr>
     <tr><td>Protocol route and wrapper controls are stable.</td><td>Separated Rust tests beside the crate test root, not product operator bodies.</td><td><code>cargo test mcp_interface_tests</code></td></tr>
+    <tr><td>Event-plane mount table and verifier are complete.</td><td><a href="../../src/event_plane_tests.rs">src/event_plane_tests.rs</a>.</td><td><code>cargo test event_plane_tests</code></td></tr>
+    <tr><td>Request lifetime timeout/cancel/progress behavior holds in normal and daemon mode.</td><td><a href="../../tests/integration.rs">tests/integration.rs</a>.</td><td><code>GATE-LIFETIME-01</code></td></tr>
     <tr><td>Backend hooks and observe flow work.</td><td><a href="../../tests/backend_hooks.rs">tests/backend_hooks.rs</a> plus integration peer bridge tests.</td><td><code>GATE-BACKEND-OBS-01</code></td></tr>
     <tr><td>Daemon sharing and bidirectional MCP traffic hold.</td><td><a href="../../tests/integration.rs">tests/integration.rs</a> and <a href="../../scripts/test-daemon.sh">scripts/test-daemon.sh</a>.</td><td><code>GATE-BIDI-01</code>, <code>GATE-DAEMON-01</code></td></tr>
     <tr><td>Docs stay navigable and architecture-owned.</td><td>Handbook link, Markdown coverage, and line audits.</td><td><code>GATE-DOCS-01</code></td></tr>

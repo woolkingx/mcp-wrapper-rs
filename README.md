@@ -50,7 +50,9 @@ Four ideas define the product:
   (`tools/call`, `resources/read`, …) actually needs them — so an idle wrapper
   costs almost nothing. The externally served `tools/list` / `initialize` views
   are **hold-state**: rebuilt only when backend data loads or refreshes, never
-  recomputed per request.
+  recomputed per request. A refresh validates every selected discovery result
+  into one candidate and atomically replaces the committed snapshot; errors,
+  stale revisions, and backend-generation changes preserve the previous truth.
 
 - **One unified control surface: `mcp.wrapper`.** The wrapper injects exactly
   one reserved tool, `mcp.wrapper`, into `tools/list`. Backend status, ping,
@@ -61,11 +63,13 @@ Four ideas define the product:
 
 - **Owner-local lifecycle.** Each piece of state has exactly one owner.
   `BackendSlot` owns the backend process — its alive decision, restart/stop
-  transitions, and the active-call safety invariant (stop and non-force restart
-  are rejected while calls are in flight). `Cache` owns discovery data and the
-  external view lifetime. `tools` is the external entry and dispatch layer; it
-  owns the action schema and envelope but holds **no** lifecycle state — it
-  routes actions to owner methods. Validation lives on the invocation objects
+  transitions, and the active-call safety invariant. `RequestLifetime` owns
+  request identity as session-aware rows and derives active-call state from
+  those rows, so cancellation, completion, and backend generation cannot be
+  confused across clients. `Cache` owns discovery data and the external view
+  lifetime. `tools` is the external entry and dispatch layer; it owns the
+  action schema and envelope but holds **no** lifecycle state — it routes
+  actions to owner methods. Validation lives on the invocation objects
   themselves, not in a separate validator.
 
 - **Observe → hook → readback control plane.** Backend facts (process exit,
@@ -75,9 +79,12 @@ Four ideas define the product:
   Status is evidence, not a hope attached to a command.
 
 In **daemon mode**, one broker owns a single shared backend/cache pair and
-fans out to many client sessions; the active-call safety counter is
-broker-global, so no session can stop or restart the shared backend while
-another session has work in flight.
+fans out to many client sessions. Client identity is the composite
+`(session_id, client_request_id)` rather than a process-global JSON-RPC ID, and
+the broker joins it to backend request identity and generation. Active-call
+safety is derived from those live request rows, so one session cannot cancel
+another session's request or stop/restart the shared backend while work is in
+flight.
 
 ### What it fills in over plain stdio MCP
 
@@ -163,7 +170,7 @@ wrapper 3 (stdio) ──→ UDS ──→ broker ──↗
 The first wrapper auto-spawns the broker; subsequent wrappers connect to it. The broker manages:
 - Shared cache (initialize, tools/list, etc.)
 - Backend subprocess lifecycle (lazy spawn, respawn on failure)
-- Request multiplexing with ID remapping
+- Session-aware request multiplexing with generation-safe ID remapping
 - Notification fanout to all connected clients
 - Graceful shutdown: broker spawned via `--daemon` runs until explicit SIGTERM
 

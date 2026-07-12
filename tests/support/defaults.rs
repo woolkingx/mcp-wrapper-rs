@@ -105,8 +105,8 @@ mod tests {
         });
         let mut data = json!({"b": "world"});
         apply_defaults(&mut data, &schema);
-        assert_eq!(data["a"], json!(10));       // filled
-        assert_eq!(data["b"], json!("world"));  // kept
-        assert_eq!(data["c"], Value::Null);     // no default in schema
+        assert_eq!(data["a"], json!(10)); // filled
+        assert_eq!(data["b"], json!("world")); // kept
+        assert_eq!(data["c"], Value::Null); // no default in schema
     }
 }

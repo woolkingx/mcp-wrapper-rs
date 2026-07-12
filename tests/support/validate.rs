@@ -41,7 +41,11 @@ pub fn check_value(schema: &Value, value: &Value) -> Result<(), ValidationError>
     check_value_with_root(schema, value, None)
 }
 
-pub fn check_value_with_root(schema: &Value, value: &Value, root: Option<&Value>) -> Result<(), ValidationError> {
+pub fn check_value_with_root(
+    schema: &Value,
+    value: &Value,
+    root: Option<&Value>,
+) -> Result<(), ValidationError> {
     // Boolean schema: true accepts everything, false rejects everything
     if let Some(b) = schema.as_bool() {
         return if b {
@@ -117,7 +121,10 @@ pub fn check_value_with_root(schema: &Value, value: &Value, root: Option<&Value>
 
     // --- oneOf ---
     if let Some(Value::Array(subs)) = obj.get("oneOf") {
-        let match_count = subs.iter().filter(|s| check_value_with_root(s, value, root).is_ok()).count();
+        let match_count = subs
+            .iter()
+            .filter(|s| check_value_with_root(s, value, root).is_ok())
+            .count();
         if match_count == 0 {
             return Err(ValidationError::root(
                 ErrorKind::OneOfNoneMatch,
@@ -134,7 +141,9 @@ pub fn check_value_with_root(schema: &Value, value: &Value, root: Option<&Value>
 
     // --- anyOf ---
     if let Some(Value::Array(subs)) = obj.get("anyOf") {
-        let any_match = subs.iter().any(|s| check_value_with_root(s, value, root).is_ok());
+        let any_match = subs
+            .iter()
+            .any(|s| check_value_with_root(s, value, root).is_ok());
         if !any_match {
             return Err(ValidationError::root(
                 ErrorKind::AnyOfNoneMatch,
@@ -146,12 +155,8 @@ pub fn check_value_with_root(schema: &Value, value: &Value, root: Option<&Value>
     // --- allOf ---
     if let Some(Value::Array(subs)) = obj.get("allOf") {
         for (i, sub) in subs.iter().enumerate() {
-            check_value_with_root(sub, value, root).map_err(|e| {
-                ValidationError::root(
-                    e.kind,
-                    format!("allOf[{i}]: {}", e.message),
-                )
-            })?;
+            check_value_with_root(sub, value, root)
+                .map_err(|e| ValidationError::root(e.kind, format!("allOf[{i}]: {}", e.message)))?;
         }
     }
 
@@ -168,10 +173,7 @@ pub fn check_value_with_root(schema: &Value, value: &Value, root: Option<&Value>
             }
         } else if let Some(else_schema) = obj.get("else") {
             check_value_with_root(else_schema, value, root).map_err(|e| {
-                ValidationError::root(
-                    ErrorKind::IfThenFailed,
-                    format!("if/else: {}", e.message),
-                )
+                ValidationError::root(ErrorKind::IfThenFailed, format!("if/else: {}", e.message))
             })?;
         }
     }
@@ -181,7 +183,12 @@ pub fn check_value_with_root(schema: &Value, value: &Value, root: Option<&Value>
 
 /// Validate a single field value against its sub-schema.
 /// Returns descriptive error with field name context.
-pub fn check_field(field: &str, schema: &Value, value: &Value, root: Option<&Value>) -> Result<(), ValidationError> {
+pub fn check_field(
+    field: &str,
+    schema: &Value,
+    value: &Value,
+    root: Option<&Value>,
+) -> Result<(), ValidationError> {
     check_value_with_root(schema, value, root).map_err(|e| e.at_field(field))
 }
 
@@ -227,10 +234,7 @@ fn check_type(type_spec: &Value, value: &Value) -> Result<(), ValidationError> {
 
 // --- Numeric ---
 
-fn check_numeric(
-    schema: &serde_json::Map<String, Value>,
-    n: f64,
-) -> Result<(), ValidationError> {
+fn check_numeric(schema: &serde_json::Map<String, Value>, n: f64) -> Result<(), ValidationError> {
     if let Some(min) = schema.get("minimum").and_then(|v| v.as_f64()) {
         if n < min {
             return Err(ValidationError::root(
@@ -284,10 +288,7 @@ fn check_numeric(
 
 // --- String ---
 
-fn check_string(
-    schema: &serde_json::Map<String, Value>,
-    s: &str,
-) -> Result<(), ValidationError> {
+fn check_string(schema: &serde_json::Map<String, Value>, s: &str) -> Result<(), ValidationError> {
     let len = s.graphemes(true).count();
 
     if let Some(min) = schema.get("minLength").and_then(as_usize) {
@@ -398,7 +399,8 @@ fn check_array(
                     }
                     if additional.is_object() {
                         for (i, item) in arr.iter().enumerate().skip(item_schemas.len()) {
-                            check_value_with_root(additional, item, root).map_err(|e| e.at_index(i))?;
+                            check_value_with_root(additional, item, root)
+                                .map_err(|e| e.at_index(i))?;
                         }
                     }
                 }
@@ -422,7 +424,9 @@ fn check_array(
                 ));
             }
         } else {
-            let any_match = arr.iter().any(|item| check_value_with_root(contains_schema, item, root).is_ok());
+            let any_match = arr
+                .iter()
+                .any(|item| check_value_with_root(contains_schema, item, root).is_ok());
             if !any_match {
                 return Err(ValidationError::root(
                     ErrorKind::Contains,
@@ -462,7 +466,10 @@ fn check_object(
         if map.len() < min {
             return Err(ValidationError::root(
                 ErrorKind::MinProperties,
-                format!("object has {} properties, minProperties is {min}", map.len()),
+                format!(
+                    "object has {} properties, minProperties is {min}",
+                    map.len()
+                ),
             ));
         }
     }
@@ -470,7 +477,10 @@ fn check_object(
         if map.len() > max {
             return Err(ValidationError::root(
                 ErrorKind::MaxProperties,
-                format!("object has {} properties, maxProperties is {max}", map.len()),
+                format!(
+                    "object has {} properties, maxProperties is {max}",
+                    map.len()
+                ),
             ));
         }
     }
@@ -492,8 +502,7 @@ fn check_object(
             if let Ok(re) = cached_regex(pat) {
                 for (vk, vv) in map {
                     if re.is_match(vk) {
-                        check_value_with_root(pat_schema, vv, root)
-                            .map_err(|e| e.at_field(vk))?;
+                        check_value_with_root(pat_schema, vv, root).map_err(|e| e.at_field(vk))?;
                     }
                 }
             }
@@ -508,11 +517,7 @@ fn check_object(
                 .unwrap_or_default();
 
             let pp_patterns: Vec<Regex> = pattern_props
-                .map(|pp| {
-                    pp.keys()
-                        .filter_map(|k| cached_regex(k).ok())
-                        .collect()
-                })
+                .map(|pp| pp.keys().filter_map(|k| cached_regex(k).ok()).collect())
                 .unwrap_or_default();
 
             for (vk, vv) in map {
@@ -530,8 +535,7 @@ fn check_object(
                     ));
                 }
                 if ap.is_object() {
-                    check_value_with_root(ap, vv, root)
-                        .map_err(|e| e.at_field(vk))?;
+                    check_value_with_root(ap, vv, root).map_err(|e| e.at_field(vk))?;
                 }
             }
         }
@@ -906,8 +910,16 @@ mod tests {
             }
         });
         let err = check_value(&s, &json!({"user": {"age": "not_int"}})).unwrap_err();
-        assert!(err.path.contains("user"), "path should contain 'user': {}", err.path);
-        assert!(err.path.contains("age"), "path should contain 'age': {}", err.path);
+        assert!(
+            err.path.contains("user"),
+            "path should contain 'user': {}",
+            err.path
+        );
+        assert!(
+            err.path.contains("age"),
+            "path should contain 'age': {}",
+            err.path
+        );
     }
 
     // --- Non-object schema ---
